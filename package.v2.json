@@ -1,0 +1,12 @@
+{
+  "CourseOrganizer": {
+    "name": "课程自动整理",
+    "description": "整理顶层课程目录中的文件，按自然顺序重命名并按目录季节标识移动到对应 Season 目录。",
+    "labels": "文件整理",
+    "version": "1.1.0",
+    "icon": "icons/courseorganizer.svg",
+    "author": "OpenAI",
+    "level": 1,
+    "release": true
+  }
+}

@@ -1,0 +1,15 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.so
+
+# Test/coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Packaging artifacts
+*.egg-info/
+
+# OS/editor files
+.DS_Store
