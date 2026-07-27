@@ -37,6 +37,7 @@ except Exception:
 
 _NATURAL_SPLIT_RE = re.compile(r"(\d+)")
 _INVALID_NAME_RE = re.compile(r"[\\/:*?\"<>|]+")
+_LEADING_EPISODE_RE = re.compile(r"^(0*\d+)(?=[\s._\-、，—–·．・]|$)")
 _CHINESE_NUMERAL_MAP = {
     "零": 0,
     "一": 1,
@@ -59,7 +60,7 @@ class CourseOrganizer(_PluginBase):
     plugin_config_prefix = "courseorganizer_"
     auth_level = 1
     plugin_order = 90
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_desc = "整理课程目录：两次快照稳定后按目录季节标识移动文件"
     plugin_author = "OpenAI"
     plugin_icon = "icons/courseorganizer.svg"
@@ -300,14 +301,45 @@ class CourseOrganizer(_PluginBase):
 
         moved_files = 0
         moved_subtitles = 0
+        safe_course_name = self._safe_name(course_name)
         for season in sorted(media_by_season.keys()):
             season_files = sorted(media_by_season[season], key=lambda file_path: self._course_sort_key(file_path, course_path))
             season_root = os.path.join(output_course_root, f"Season {season}")
             os.makedirs(season_root, exist_ok=True)
+            leading_episodes = [self._extract_leading_episode(media_file) for media_file in season_files]
+            leading_counts: Dict[int, int] = {}
+            for episode in leading_episodes:
+                if episode is not None:
+                    leading_counts[episode] = leading_counts.get(episode, 0) + 1
 
-            for index, media_file in enumerate(season_files, start=1):
+            used_episodes = set(self._collect_existing_episodes(season_root, safe_course_name, season))
+            unique_leading_episodes = [
+                episode
+                for episode, count in leading_counts.items()
+                if count == 1
+            ]
+            next_episode = max(
+                self._next_episode_number(season_root, safe_course_name, season),
+                max(unique_leading_episodes, default=0) + 1,
+            )
+
+            for media_file, leading_episode in zip(season_files, leading_episodes):
+                if (
+                    leading_episode is not None
+                    and leading_counts.get(leading_episode, 0) == 1
+                    and leading_episode not in used_episodes
+                ):
+                    index = leading_episode
+                else:
+                    while next_episode in used_episodes:
+                        next_episode += 1
+                    index = next_episode
+                    next_episode += 1
+
+                used_episodes.add(index)
+
                 ext = self._lower_extension(media_file)
-                episode_name = f"{self._safe_name(course_name)} - S{season:02d}E{index:02d}{ext}"
+                episode_name = f"{safe_course_name} - S{season:02d}E{index:03d}{ext}"
                 target_media = self._reserve_path(os.path.join(season_root, episode_name))
                 self._move_file(media_file, target_media)
                 moved_files += 1
@@ -315,7 +347,7 @@ class CourseOrganizer(_PluginBase):
                 media_key = os.path.splitext(os.path.basename(media_file))[0].lower()
                 for subtitle_file in subtitle_by_season.get(season, {}).get(media_key, []):
                     subtitle_ext = self._lower_extension(subtitle_file)
-                    subtitle_name = f"{self._safe_name(course_name)} - S{season:02d}E{index:02d}{subtitle_ext}"
+                    subtitle_name = f"{safe_course_name} - S{season:02d}E{index:03d}{subtitle_ext}"
                     target_subtitle = self._reserve_path(os.path.join(season_root, subtitle_name))
                     self._move_file(subtitle_file, target_subtitle)
                     moved_subtitles += 1
@@ -480,6 +512,56 @@ class CourseOrganizer(_PluginBase):
     @staticmethod
     def _lower_extension(filename: str) -> str:
         return os.path.splitext(filename)[1].lower()
+
+    @classmethod
+    def _extract_leading_episode(cls, file_path: str) -> Optional[int]:
+        stem = os.path.splitext(os.path.basename(file_path))[0].strip()
+        match = _LEADING_EPISODE_RE.match(stem)
+        if not match:
+            return None
+
+        try:
+            value = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+
+        return value
+
+    @classmethod
+    def _collect_existing_episodes(
+        cls, season_root: str, safe_course_name: str, season: int
+    ) -> List[int]:
+        if not os.path.isdir(season_root):
+            return []
+
+        episode_pattern = re.compile(
+            rf"^{re.escape(safe_course_name)} - S{season:02d}E([0-9]+)(?:_[0-9]+)?$"
+        )
+        episodes: List[int] = []
+        for filename in os.listdir(season_root):
+            episode_path = os.path.join(season_root, filename)
+            if not os.path.isfile(episode_path):
+                continue
+            stem, extension = os.path.splitext(filename)
+            if extension.lower() not in cls.MEDIA_EXTENSIONS:
+                continue
+            match = episode_pattern.fullmatch(stem)
+            if match:
+                try:
+                    episodes.append(int(match.group(1)))
+                except (TypeError, ValueError):
+                    pass
+
+        return episodes
+
+    @classmethod
+    def _next_episode_number(cls, season_root: str, safe_course_name: str, season: int) -> int:
+        if not os.path.isdir(season_root):
+            return 1
+
+        return max(cls._collect_existing_episodes(season_root, safe_course_name, season), default=0) + 1
 
     @classmethod
     def _state_key(cls, course_name: str) -> str:
