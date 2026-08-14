@@ -1,15 +1,15 @@
-import importlib.util
+import errno
 import json
+import os
+import pytest
+import stat
+import threading
 from pathlib import Path
 
+from tests.courseorganizer_testkit import load_courseorganizer
 
-PLUGIN_PATH = (
-    Path(__file__).parents[1] / "plugins.v2" / "courseorganizer" / "__init__.py"
-)
-SPEC = importlib.util.spec_from_file_location("courseorganizer", PLUGIN_PATH)
-MODULE = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-SPEC.loader.exec_module(MODULE)
+
+MODULE = load_courseorganizer()
 CourseOrganizer = MODULE.CourseOrganizer
 
 
@@ -17,18 +17,320 @@ def test_plugin_version_matches_package_metadata():
     package_path = Path(__file__).parents[1] / "package.v2.json"
     package = json.loads(package_path.read_text(encoding="utf-8"))
 
-    assert CourseOrganizer.plugin_version == "1.2.0"
+    assert CourseOrganizer.plugin_version == "1.5.2"
     assert package["CourseOrganizer"]["version"] == CourseOrganizer.plugin_version
 
 
+def test_normalize_config_defaults_invalid_uncertain_policy_to_local_and_reflects_in_ui_text():
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "naming_mode": "apply",
+            "naming_uncertain_policy": "invalid-policy",
+        }
+    )
+    config = organizer._get_config()
+
+    assert config["naming_uncertain_policy"] == "local"
+    page = str(organizer.get_page())
+    assert "低置信度时保留本地名" in page
+    assert "低置信度时暂停整理" not in page
+
+
+def test_empty_config_disables_service_and_scheduled_run_without_side_effects(monkeypatch):
+    organizer = CourseOrganizer(config={})
+    processed = []
+
+    monkeypatch.setattr(organizer, "_process_course", lambda *args, **kwargs: processed.append(args))
+
+    assert organizer.get_service() == []
+    organizer._run(force=False)
+
+    assert processed == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("1-2.mp4", (1, 2)),
+        ("01-02 标题.mp4", (1, 2)),
+        ("第1-2集.mp4", (1, 2)),
+        ("E01-E02.mp4", (1, 2)),
+        ("EP01-02.mp4", (1, 2)),
+        ("001.单集.mp4", (1, 1)),
+    ],
+)
+def test_extracts_supported_leading_episode_spans(filename, expected):
+    assert CourseOrganizer._extract_leading_episode_span(filename) == expected
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("0-1.mp4", None),
+        ("2-1.mp4", None),
+        ("1-1001.mp4", None),
+        ("2020-2024 课程.mp4", None),
+        ("1-2课程.mp4", None),
+    ],
+)
+def test_rejects_invalid_leading_episode_spans(filename, expected):
+    assert CourseOrganizer._extract_leading_episode_span(filename) == expected
+
+
+@pytest.mark.parametrize(
+    ("course_name", "expected"),
+    [
+        (".", "Course"),
+        ("..", "Course"),
+        (" . ", "Course"),
+        ("\t..\t", "Course"),
+    ],
+)
+def test_safe_name_canonicalizes_dot_names(course_name, expected):
+    assert CourseOrganizer._safe_name(course_name) == expected
+
+
+def test_safe_name_prevents_output_root_escape_for_dot_names(tmp_path):
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+
+    for course_name in (".", "..", " . ", "\t..\t"):
+        assert output_root / CourseOrganizer._safe_name(course_name) == output_root / "Course"
+
+
+def test_safe_name_preserves_regular_dot_titles():
+    assert CourseOrganizer._safe_name("Season 1.2 - Test") == "Season 1.2 - Test"
+
+
+def test_detect_season_from_path_prefers_deepest_matching_component(tmp_path):
+    course_path = tmp_path / "Course"
+    nested = course_path / "Season 1" / "S02"
+    nested.mkdir(parents=True)
+    candidate = nested / "episode.mp4"
+
+    assert CourseOrganizer._detect_season_from_path(
+        str(candidate),
+        str(course_path),
+    ) == (2, True)
+
+
 def _organizer():
-    return CourseOrganizer(config={"enabled": True})
+    return CourseOrganizer(config={"enabled": True, "naming_mode": "off"})
+
+EXPECTED_INCOMPLETE_SUFFIXES = (".partial", ".part", ".tmp", ".crdownload", ".incomplete", ".!qb")
+
+
+@pytest.mark.parametrize("suffix", EXPECTED_INCOMPLETE_SUFFIXES)
+def test_incomplete_suffixes_block_processing(tmp_path, suffix):
+    assert CourseOrganizer.INCOMPLETE_SUFFIXES == EXPECTED_INCOMPLETE_SUFFIXES
+
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    course = incoming / "Course"
+
+    incoming.mkdir()
+    output.mkdir()
+    course.mkdir(parents=True)
+    (course / "lesson.mp4").write_bytes(b"video")
+    (course / f"lesson{suffix}").write_bytes(b"marker")
+
+    organizer = _organizer()
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert organizer._process_course("Course", str(course), str(output)) is False
+
+    assert (course / "lesson.mp4").exists()
+    assert (course / f"lesson{suffix}").exists()
+    assert not any(output.iterdir())
+
+
+def test_nested_uppercase_incomplete_marker_blocks_processing(tmp_path):
+    incoming = tmp_path / "incoming"
+    output_root = tmp_path / "output"
+    course = incoming / "Course"
+    nested_marker = course / "Downloads" / "partial" / "lesson.PART"
+
+    incoming.mkdir()
+    output_root.mkdir()
+    course.mkdir(parents=True)
+    nested_marker.parent.mkdir(parents=True)
+
+    (course / "lesson.mp4").write_bytes(b"video")
+    nested_marker.write_bytes(b"marker")
+
+    organizer = _organizer()
+    assert organizer._process_course("Course", str(course), str(output_root)) is False
+    assert organizer._process_course("Course", str(course), str(output_root)) is False
+
+    assert (course / "lesson.mp4").exists()
+    assert nested_marker.exists()
+    assert not any(output_root.iterdir())
+
+
+def test_incomplete_marker_created_after_second_snapshot_blocks_processing(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output_root = tmp_path / "output"
+    course = incoming / "Course"
+    marker = course / "Downloads" / "Partial" / "late.PART"
+
+    incoming.mkdir()
+    output_root.mkdir()
+    course.mkdir(parents=True)
+    marker.parent.mkdir(parents=True)
+
+    (course / "lesson.mp4").write_bytes(b"video")
+    organizer = _organizer()
+    assert organizer._process_course("Course", str(course), str(output_root)) is False
+
+    snapshot_calls = {"count": 0}
+    original_snapshot = organizer._snapshot_signature
+
+    def delayed_incomplete_marker_snapshot(course_path):
+        snapshot = original_snapshot(course_path)
+        snapshot_calls["count"] += 1
+        if snapshot_calls["count"] == 2:
+            marker.write_bytes(b"late")
+        return snapshot
+
+    monkeypatch.setattr(organizer, "_snapshot_signature", delayed_incomplete_marker_snapshot)
+    assert organizer._process_course("Course", str(course), str(output_root)) is False
+    assert snapshot_calls["count"] == 2
+    assert (course / "lesson.mp4").exists()
+    assert marker.exists()
+    assert not any(output_root.iterdir())
+
+
+def test_threaded_late_uppercase_incomplete_marker_blocks_processing(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output_root = tmp_path / "output"
+    course = incoming / "Course"
+    marker = course / "Downloads" / "Partial" / "late.PART"
+
+    incoming.mkdir()
+    output_root.mkdir()
+    course.mkdir(parents=True)
+    marker.parent.mkdir(parents=True)
+
+    (course / "lesson.mp4").write_bytes(b"video")
+    organizer = _organizer()
+    assert organizer._process_course("Course", str(course), str(output_root)) is False
+
+    snapshot_calls = {"count": 0}
+    second_snapshot_ready = threading.Event()
+    writer_done = threading.Event()
+    writer_error: list[BaseException] = []
+    original_snapshot = organizer._snapshot_signature
+
+    def create_late_marker():
+        try:
+            assert second_snapshot_ready.wait(timeout=5), "writer did not observe second snapshot"
+            marker.write_bytes(b"late")
+        except Exception as error:
+            writer_error.append(error)
+        finally:
+            writer_done.set()
+
+    writer = threading.Thread(target=create_late_marker)
+
+    def delayed_snapshot(course_path):
+        snapshot = original_snapshot(course_path)
+        snapshot_calls["count"] += 1
+        if snapshot_calls["count"] == 2:
+            second_snapshot_ready.set()
+            assert writer_done.wait(timeout=5), "writer should finish before final guard"
+        return snapshot
+
+    monkeypatch.setattr(organizer, "_snapshot_signature", delayed_snapshot)
+    writer.start()
+    try:
+        assert organizer._process_course("Course", str(course), str(output_root)) is False
+    finally:
+        writer.join(timeout=5)
+    assert not writer.is_alive()
+    assert not writer_error
+    assert writer_done.is_set()
+    assert snapshot_calls["count"] == 2
+    assert (course / "lesson.mp4").exists()
+    assert marker.exists()
+    assert not any(output_root.iterdir())
+
+
+def test_incomplete_marker_removal_allows_recovery(tmp_path):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    course = incoming / "Course"
+    marker = course / "lesson.partial"
+
+    incoming.mkdir()
+    output.mkdir()
+    course.mkdir(parents=True)
+
+    (course / "lesson.mp4").write_bytes(b"video")
+    marker.write_bytes(b"incomplete")
+    organizer = _organizer()
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert not any(output.iterdir())
+    assert marker.exists()
+
+    marker.unlink()
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert (course / "lesson.mp4").exists()
+    assert not any(output.iterdir())
+    assert organizer._process_course("Course", str(course), str(output)) is True
+
+    renamed = output / "Course" / "Season 1" / "Course - S01E001.mp4"
+    assert renamed.read_bytes() == b"video"
+    assert not marker.exists()
+    assert not (course / "lesson.mp4").exists()
 
 
 def _process_stable_course(organizer, incoming, output, course_name):
     course_path = incoming / course_name
     assert organizer._process_course(course_name, str(course_path), str(output)) is False
     assert organizer._process_course(course_name, str(course_path), str(output)) is True
+
+
+def test_off_mode_stable_scan_skips_resolver_and_naming_preview_even_with_ai_review(
+    tmp_path, monkeypatch
+):
+    incoming = tmp_path / "incoming"
+    tv_output = tmp_path / "tv"
+    movie_output = tmp_path / "movie"
+    children_output = tmp_path / "children"
+    incoming.mkdir()
+    tv_output.mkdir()
+    movie_output.mkdir()
+    children_output.mkdir()
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "tv_output": str(tv_output),
+            "movie_output": str(movie_output),
+            "children_output": str(children_output),
+            "naming_mode": "off",
+            "naming_ai_review": True,
+        }
+    )
+
+    monkeypatch.setattr(
+        organizer,
+        "_get_resolver",
+        lambda: (_ for _ in ()).throw(AssertionError("resolver must stay unused in off mode")),
+    )
+
+    organizer._run()
+    organizer._run()
+
+    assert "naming_preview_v1" not in organizer._data
+    assert course.exists()
+    assert all(not any(root.iterdir()) for root in (tv_output, movie_output, children_output))
 
 
 def test_continues_after_highest_existing_matching_episode(tmp_path):
@@ -63,6 +365,97 @@ def test_fresh_batch_of_101_reaches_episode_101(tmp_path):
     assert len(list(season.glob("*.mp4"))) == 101
     assert (season / "Math - S01E001.mp4").read_bytes() == b"1"
     assert (season / "Math - S01E101.mp4").read_bytes() == b"101"
+
+
+def test_multi_episode_file_stays_single_file_and_assigns_range_episode(tmp_path):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    course = incoming / "Course"
+    course.mkdir(parents=True)
+    (course / "1-2.mp4").write_bytes(b"one-two")
+    (course / "1-2.srt").write_text("sub")
+    (course / "3.mp4").write_bytes(b"three")
+
+    organizer = _organizer()
+    _process_stable_course(organizer, incoming, output, "Course")
+
+    season = output / "Course" / "Season 1"
+    assert (season / "Course - S01E001-E002.mp4").read_bytes() == b"one-two"
+    assert (season / "Course - S01E001-E002.srt").read_text() == "sub"
+    assert (season / "Course - S01E003.mp4").read_bytes() == b"three"
+    assert len(list(season.glob("*.mp4"))) == 2
+
+
+def test_explicit_low_range_preserves_next_episode_cursor_with_existing_high_number(tmp_path):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    course = incoming / "Course"
+    course.mkdir(parents=True)
+    (course / "1-2.mp4").write_bytes(b"range")
+    (course / "z.mp4").write_bytes(b"next")
+
+    season = output / "Course" / "Season 1"
+    season.mkdir(parents=True)
+    (season / "Course - S01E100.mp4").write_bytes(b"existing")
+
+    organizer = _organizer()
+    _process_stable_course(organizer, incoming, output, "Course")
+
+    assert (season / "Course - S01E001-E002.mp4").read_bytes() == b"range"
+    assert (season / "Course - S01E101.mp4").read_bytes() == b"next"
+
+
+def test_existing_multi_episode_range_marks_following_content(tmp_path):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    course = incoming / "Course"
+    course.mkdir(parents=True)
+    (course / "new.mp4").write_bytes(b"new")
+
+    season = output / "Course" / "Season 1"
+    season.mkdir(parents=True)
+    (season / "Course - S01E001-E002.mp4").write_bytes(b"existing")
+
+    organizer = _organizer()
+    _process_stable_course(organizer, incoming, output, "Course")
+
+    assert (season / "Course - S01E003.mp4").read_bytes() == b"new"
+
+
+def test_existing_single_episode_keeps_multi_episode_request_from_first_conflict(tmp_path):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    course = incoming / "Course"
+    course.mkdir(parents=True)
+    (course / "1-2.mp4").write_bytes(b"range")
+
+    season = output / "Course" / "Season 1"
+    season.mkdir(parents=True)
+    (season / "Course - S01E002.mp4").write_bytes(b"existing")
+
+    organizer = _organizer()
+    _process_stable_course(organizer, incoming, output, "Course")
+
+    assert (season / "Course - S01E003-E004.mp4").read_bytes() == b"range"
+
+
+def test_duplicate_multi_episode_spans_advance_consecutively(tmp_path):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    course = incoming / "Course"
+    course.mkdir(parents=True)
+    (course / "1-2.mp4").write_bytes(b"first")
+    (course / "1-2-copy.mp4").write_bytes(b"second")
+
+    organizer = _organizer()
+    _process_stable_course(organizer, incoming, output, "Course")
+
+    season = output / "Course" / "Season 1"
+    outputs = sorted(season.glob("*.mp4"))
+    assert len(outputs) == 2
+    assert outputs[0].name == "Course - S01E001-E002.mp4"
+    assert outputs[1].name == "Course - S01E003-E004.mp4"
+    assert sorted({outputs[0].read_bytes(), outputs[1].read_bytes()}) == [b"first", b"second"]
 
 
 def test_seasons_continue_independently(tmp_path):
@@ -275,3 +668,1444 @@ def test_high_numbered_episodes_continue_naturally(tmp_path):
     _process_stable_course(organizer, incoming, output, "Course")
 
     assert (season / "Course - S01E1000.mp4").read_bytes() == b"next"
+
+
+def test_stability_state_reads_data_without_passing_a_fake_default(tmp_path):
+    class HostShapedOrganizer(CourseOrganizer):
+        def get_data(self, key=None, plugin_id=None):
+            assert plugin_id is None
+            return self._data.get(key)
+
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    course = incoming / "Course"
+    incoming.mkdir()
+    output.mkdir()
+    course.mkdir(parents=True)
+    (course / "lesson.mp4").write_bytes(b"x")
+
+    organizer = HostShapedOrganizer(config={"enabled": True})
+    assert organizer._process_course("Course", str(course), str(output)) is False
+
+
+class _RunLogger:
+    def __init__(self):
+        self.errors = []
+        self.infos = []
+        self.debugs = []
+
+    def _format_messages(self, message: str, *args: object, **kwargs: object) -> str:
+        # noqa: ARG001
+        if args:
+            try:
+                return message % args
+            except TypeError:
+                return str(message)
+        return str(message)
+
+    def error(self, message: str, *args: object, **kwargs: object) -> None:  # noqa: ARG001
+        self.errors.append(self._format_messages(message, *args, **kwargs))
+
+    def info(self, *args: object, **kwargs: object) -> None:  # noqa: ARG001
+        message = str(args[0]) if args else ""
+        self.infos.append(self._format_messages(message, *args[1:], **kwargs))
+
+    def debug(self, *args: object, **kwargs: object) -> None:  # noqa: ARG001
+        message = str(args[0]) if args else ""
+        self.debugs.append(self._format_messages(message, *args[1:], **kwargs))
+
+
+def _event_counts_from_log(message: str) -> dict[str, int]:
+    values = {}
+    for token in str(message).split():
+        if "=" not in token:
+            continue
+        key, raw = token.split("=", 1)
+        try:
+            values[key] = int(raw)
+        except ValueError:
+            continue
+    return values
+
+
+def test_run_once_preview_lifecycle_is_fail_closed_and_resets(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    tv_output = tmp_path / "tv"
+    movie_output = tmp_path / "movie"
+    children_output = tmp_path / "children"
+    for directory in (incoming, tv_output, movie_output, children_output):
+        directory.mkdir()
+
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    config = {
+        "enabled": False,
+        "run_once": True,
+        "incoming": str(incoming),
+        "tv_output": str(tv_output),
+        "movie_output": str(movie_output),
+        "children_output": str(children_output),
+        "interval": 611,
+        "naming_mode": "preview",
+        "naming_sources": "douban,themoviedb",
+        "naming_auto_threshold": 93,
+        "naming_min_margin": 15,
+        "naming_uncertain_policy": "hold",
+        "naming_append_tmdb_id": True,
+        "naming_ai_review": False,
+        "naming_manual_overrides": "",
+        "naming_clear_cache_once": False,
+    }
+
+    class FakeTimer:
+        created = []
+
+        def __init__(self, interval, callback):
+            self.interval = interval
+            self.callback = callback
+            self.daemon = False
+            self.started = False
+            self.cancelled = False
+            self.__class__.created.append(self)
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return self.started and not self.cancelled
+
+        def cancel(self):
+            self.cancelled = True
+
+    def fingerprint(root):
+        paths = [root, *root.rglob("*")]
+        return [
+            (
+                path.relative_to(root).as_posix(),
+                path.is_dir(),
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+                path.read_bytes() if path.is_file() else None,
+            )
+            for path in sorted(paths)
+        ]
+
+    roots = (incoming, tv_output, movie_output, children_output)
+    before = {root.name: fingerprint(root) for root in roots}
+    organizer = CourseOrganizer(config=dict(config))
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+    monkeypatch.setattr(MODULE.threading, "Timer", FakeTimer)
+
+    organizer.init_plugin(dict(config))
+
+    assert len(FakeTimer.created) == 1
+    timer = FakeTimer.created[0]
+    assert timer.interval == pytest.approx(0.2)
+    assert timer.started is True
+    expected_config = {**config, "run_once": False}
+    assert organizer._get_config() == expected_config
+
+    timer.callback()
+
+    scan_started = [
+        message
+        for message in logger.debugs
+        if "CourseOrganizer[event=scan_started]" in message
+    ]
+    assert scan_started == [
+        "CourseOrganizer[event=scan_started] trigger=manual mode=preview"
+    ]
+    scan_completed = [
+        message
+        for message in logger.infos
+        if "CourseOrganizer[event=scan_completed]" in message
+    ]
+    assert len(scan_completed) == 1
+    assert "trigger=manual" in scan_completed[0]
+    assert _event_counts_from_log(scan_completed[0]) == {"scanned": 1, "moved": 0}
+    all_messages = logger.errors + logger.infos + logger.debugs
+    assert not any("CourseOrganizer[event=move_started]" in message for message in all_messages)
+    assert not any("CourseOrganizer[event=move_completed]" in message for message in all_messages)
+    assert {root.name: fingerprint(root) for root in roots} == before
+    assert organizer._get_config() == expected_config
+
+
+def test_stability_defer_branches_emit_structured_item_events_without_paths(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    incoming.mkdir()
+    output.mkdir()
+
+    organizer = CourseOrganizer(config={"enabled": True, "naming_mode": "off"})
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    def make_course(name: str) -> Path:
+        course = incoming / name
+        course.mkdir()
+        (course / "lesson.mp4").write_bytes(b"video")
+        return course
+
+    first = make_course("First")
+    assert organizer._process_course("First", str(first), str(output)) is False
+
+    changed = make_course("Changed")
+    assert organizer._process_course("Changed", str(changed), str(output)) is False
+    (changed / "lesson.mp4").write_bytes(b"changed")
+    assert organizer._process_course("Changed", str(changed), str(output)) is False
+
+    pending = make_course("Pending")
+    assert organizer._process_course("Pending", str(pending), str(output)) is False
+    pending_key = organizer._state_key("Pending")
+    pending_signature = organizer._snapshot_signature(str(pending))
+    organizer.save_data(pending_key, {"signature": pending_signature, "stable_count": 0})
+    assert organizer._process_course("Pending", str(pending), str(output)) is False
+
+    final = make_course("Final")
+    assert organizer._process_course("Final", str(final), str(output)) is False
+    final_key = organizer._state_key("Final")
+    final_signature = organizer._snapshot_signature(str(final))
+    organizer.save_data(final_key, {"signature": final_signature, "stable_count": 1})
+    snapshot_calls = {"count": 0}
+
+    def changed_final_snapshot(course_path: str):
+        snapshot_calls["count"] += 1
+        current = CourseOrganizer._snapshot_signature(organizer, course_path)
+        if snapshot_calls["count"] == 1:
+            return current
+        return current + [("late-marker", 0, 0)]
+
+    monkeypatch.setattr(organizer, "_snapshot_signature", changed_final_snapshot)
+    assert organizer._process_course("Final", str(final), str(output)) is False
+
+    assert any(
+        "CourseOrganizer[event=item_deferred] item_course=First "
+        "item_reason=first_snapshot item_stable_count=1" in message
+        for message in logger.debugs
+    )
+    assert any(
+        "CourseOrganizer[event=item_deferred] item_course=Changed "
+        "item_reason=changed_before_stabilization item_stable_count=1" in message
+        for message in logger.debugs
+    )
+    assert any(
+        "CourseOrganizer[event=item_deferred] item_course=Pending "
+        "item_reason=stable_count_pending item_stable_count=1" in message
+        for message in logger.debugs
+    )
+    assert any(
+        "CourseOrganizer[event=item_deferred] item_course=Final "
+        "item_reason=changed_before_final_confirmation item_stable_count=1" in message
+        for message in logger.debugs
+    )
+    assert all(str(tmp_path) not in message for message in logger.debugs)
+
+
+def test_run_skips_when_target_output_root_missing_without_leaking_full_paths(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming_secret_token_alpha"
+    tv_output = tmp_path / "tv_secret_token_alpha"
+    movie_output = tmp_path / "movie_secret_token_alpha"
+    missing_children_output = tmp_path / "children_secret_token_alpha"
+
+    incoming.mkdir()
+    tv_output.mkdir()
+    movie_output.mkdir()
+
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "tv_output": str(tv_output),
+            "movie_output": str(movie_output),
+            "children_output": str(missing_children_output),
+        }
+    )
+
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+    called = []
+
+    def blocked_course(*args: object, **kwargs: object) -> bool:
+        called.append(True)
+        return True
+
+    monkeypatch.setattr(organizer, "_process_course", blocked_course)
+
+    organizer._run()
+
+    assert called == []
+    all_logged = logger.errors + logger.debugs + logger.infos
+    assert any("output path not exist for library: children" in err for err in logger.errors)
+    assert not missing_children_output.exists()
+    for sensitive in (
+        str(incoming),
+        str(tv_output),
+        str(movie_output),
+        str(missing_children_output),
+        "secret_token_alpha",
+    ):
+        assert all(sensitive not in message for message in all_logged)
+
+
+def test_run_rejects_invalid_incoming_without_leaking_full_paths(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming_secret_token_beta"
+    tv_output = tmp_path / "tv_secret_token_beta"
+    movie_output = tmp_path / "movie_secret_token_beta"
+    children_output = tmp_path / "children_secret_token_beta"
+
+    tv_output.mkdir()
+    movie_output.mkdir()
+    children_output.mkdir()
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "tv_output": str(tv_output),
+            "movie_output": str(movie_output),
+            "children_output": str(children_output),
+        }
+    )
+
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    organizer._run()
+
+    all_logged = logger.errors + logger.debugs + logger.infos
+    assert any("incoming path invalid" in err for err in logger.errors)
+    for sensitive in (
+        str(incoming),
+        str(tv_output),
+        str(movie_output),
+        str(children_output),
+        "secret_token_beta",
+    ):
+        assert all(sensitive not in message for message in all_logged)
+
+
+def test_process_course_blocks_source_root_escape_via_symlink(tmp_path):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    external_course_root = tmp_path / "external_course"
+    external_course = external_course_root / "Course"
+
+    incoming.mkdir()
+    output.mkdir()
+    external_course.mkdir(parents=True)
+    (external_course / "lesson.mp4").write_bytes(b"video")
+
+    symlink_course = incoming / "Course"
+    symlink_course.symlink_to(external_course)
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "naming_mode": "off",
+        }
+    )
+
+    assert organizer._process_course(
+        "Course",
+        str(symlink_course),
+        str(output),
+        str(incoming),
+    ) is False
+
+    assert (external_course / "lesson.mp4").exists()
+    assert not any(output.iterdir())
+
+
+def test_process_course_blocks_destination_escape_via_output_symlinked_descendant(tmp_path):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    escaped_target = tmp_path / "escaped"
+    escaped_payload = escaped_target / "payload"
+
+    incoming.mkdir()
+    output.mkdir()
+    escaped_payload.mkdir(parents=True)
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+    (output / "Course").symlink_to(escaped_payload)
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "naming_mode": "off",
+        }
+    )
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert (course / "lesson.mp4").exists()
+    assert not any(escaped_payload.glob("*.mp4"))
+
+
+def test_process_course_source_escape_in_later_file_aborts_without_partial_move(tmp_path):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    external_course_root = tmp_path / "external"
+    external_course_root.mkdir()
+    external_video = external_course_root / "z.mp4"
+    external_video.write_bytes(b"external")
+
+    incoming.mkdir()
+    output.mkdir()
+
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "a.mp4").write_bytes(b"safe")
+    (course / "z.mp4").symlink_to(external_video)
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "naming_mode": "off",
+        }
+    )
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert organizer._process_course("Course", str(course), str(output)) is False
+
+    assert (course / "a.mp4").exists()
+    assert (course / "z.mp4").exists()
+    assert not any(output.iterdir())
+
+
+def test_process_course_destination_escape_in_later_season_aborts_without_partial_move(tmp_path):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    escaped_target = tmp_path / "escaped"
+    escaped_payload = escaped_target / "payload"
+    escaped_payload.mkdir(parents=True)
+
+    incoming.mkdir()
+    output.mkdir()
+
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "Season 1").mkdir()
+    (course / "Season 2").mkdir()
+    (course / "Season 1" / "a.mp4").write_bytes(b"first")
+    (course / "Season 2" / "b.mp4").write_bytes(b"second")
+    (output / "Course").mkdir()
+    (output / "Course" / "Season 2").symlink_to(escaped_payload)
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "naming_mode": "off",
+        }
+    )
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert organizer._process_course("Course", str(course), str(output)) is False
+
+    assert not any((output / "Course" / "Season 1").glob("*.mp4"))
+
+    assert not any(escaped_payload.glob("*.mp4"))
+
+
+def test_process_course_source_symlink_replaced_in_single_call_after_boundary_check_is_rejected(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    external_root = tmp_path / "external"
+    external_video = external_root / "outside.mp4"
+
+    incoming.mkdir()
+    output.mkdir()
+    external_root.mkdir()
+    external_video.write_bytes(b"outside")
+
+    course = incoming / "Course"
+    course.mkdir()
+    source_video = course / "a.mp4"
+    source_video.write_bytes(b"safe")
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "naming_mode": "off",
+        }
+    )
+
+    original_check = organizer._is_within_realpath
+    check_calls = {"count": 0, "replaced": False}
+
+    def raced_check(root: str, path: str) -> bool:
+        result = original_check(root, path)
+        check_calls["count"] += 1
+        if (
+            not check_calls["replaced"]
+            and os.path.abspath(root) == os.path.abspath(str(course))
+            and source_video.name in os.path.basename(path)
+        ):
+            source_video.unlink()
+            source_video.symlink_to(external_video)
+            check_calls["replaced"] = True
+            return True
+        return result
+
+    monkeypatch.setattr(organizer, "_is_within_realpath", raced_check)
+
+    organizer.save_data(
+        organizer._state_key("Course"),
+        {
+            "signature": organizer._coerce_signature(organizer._snapshot_signature(str(course))),
+            "stable_count": 1,
+        },
+    )
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert check_calls["count"] >= 1
+    assert check_calls["replaced"] is True
+    assert not any(output.iterdir())
+    assert external_video.exists()
+    assert source_video.is_symlink()
+    assert not any(path.suffix == ".mp4" and path.name.startswith(".tmp") for path in output.rglob("*"))
+
+
+def test_process_course_destination_parent_symlink_replaced_in_single_call_after_boundary_check_is_rejected(
+    tmp_path, monkeypatch
+):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    escaped = tmp_path / "escaped"
+    escaped_payload = escaped / "payload"
+
+    incoming.mkdir()
+    output.mkdir()
+    escaped_payload.mkdir(parents=True)
+
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "a.mp4").write_bytes(b"safe")
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "naming_mode": "off",
+        }
+    )
+
+    original_check = organizer._is_within_realpath
+    check_calls = {"count": 0}
+
+    def raced_check(root: str, path: str) -> bool:
+        result = original_check(root, path)
+        check_calls["count"] += 1
+        if (
+            not (check_calls["count"] == 0)
+            and os.path.abspath(root) == os.path.abspath(str(output))
+            and str(os.path.abspath(path)).startswith(str((output / "Course").resolve()))
+        ):
+            (output / "Course").symlink_to(escaped_payload)
+            return True
+        return result
+
+    monkeypatch.setattr(organizer, "_is_within_realpath", raced_check)
+
+    organizer.save_data(
+        organizer._state_key("Course"),
+        {
+            "signature": organizer._coerce_signature(organizer._snapshot_signature(str(course))),
+            "stable_count": 1,
+        },
+    )
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert check_calls["count"] >= 1
+    assert check_calls["count"] >= 2
+    assert not any(output.glob("*.mp4"))
+    assert not any(escaped_payload.glob("*.mp4"))
+    assert not any(
+        path.suffix == ".mp4" and path.name.startswith(".tmp") for path in output.rglob("*")
+    )
+    assert not any(
+        path.suffix == ".mp4" and path.name.startswith(".tmp") for path in escaped_payload.rglob("*")
+    )
+
+
+def test_process_course_source_swap_before_move_keeps_backup_and_external_bytes(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    external = tmp_path / "external"
+    incoming.mkdir()
+    output.mkdir()
+    external.mkdir()
+
+    course = incoming / "Course"
+    course.mkdir()
+    source_video = course / "lesson.mp4"
+    source_video.write_bytes(b"safe-source")
+    external_video = external / "outside.mp4"
+    external_video.write_bytes(b"external-bytes")
+    backup_video = course / "lesson.safe-backup.mp4"
+
+    organizer = _organizer()
+    organizer.save_data(
+        organizer._state_key("Course"),
+        {
+            "signature": organizer._coerce_signature(organizer._snapshot_signature(str(course))),
+            "stable_count": 1,
+        },
+    )
+
+    original_move = organizer._move_file
+    swapped = {"value": False}
+
+    def swap_then_move(*args: object, **kwargs: object) -> bool:
+        if not swapped["value"]:
+            source_video.replace(backup_video)
+            source_video.symlink_to(external_video)
+            swapped["value"] = True
+        return original_move(*args, **kwargs)
+
+    monkeypatch.setattr(organizer, "_move_file", swap_then_move)
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert swapped["value"] is True
+    assert backup_video.read_bytes() == b"safe-source"
+    assert source_video.is_symlink()
+    assert external_video.read_bytes() == b"external-bytes"
+    assert not any(path.is_file() for path in output.rglob("*"))
+    assert not any(path.name.startswith(".") and ".tmp." in path.name for path in output.rglob("*"))
+
+
+def test_process_course_destination_parent_swap_before_move_stays_bound(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    escaped = tmp_path / "escaped"
+    incoming.mkdir()
+    output.mkdir()
+    escaped.mkdir()
+
+    course = incoming / "Course"
+    course.mkdir()
+    source_video = course / "lesson.mp4"
+    source_video.write_bytes(b"safe-source")
+    marker = escaped / "marker.txt"
+    marker.write_bytes(b"marker")
+    escaped_target = escaped / "payload"
+    escaped_target.mkdir()
+    target_parent = output / "Course" / "Season 1"
+
+    organizer = _organizer()
+    organizer.save_data(
+        organizer._state_key("Course"),
+        {
+            "signature": organizer._coerce_signature(organizer._snapshot_signature(str(course))),
+            "stable_count": 1,
+        },
+    )
+
+    original_move = organizer._move_file
+    swapped = {"value": False}
+
+    def swap_then_move(*args: object, **kwargs: object) -> bool:
+        if not swapped["value"]:
+            target_parent.parent.mkdir(parents=True, exist_ok=True)
+            target_parent.symlink_to(escaped_target)
+            swapped["value"] = True
+        return original_move(*args, **kwargs)
+
+    monkeypatch.setattr(organizer, "_move_file", swap_then_move)
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert swapped["value"] is True
+    assert source_video.read_bytes() == b"safe-source"
+    assert marker.read_bytes() == b"marker"
+    assert not any(path.is_file() for path in escaped_target.rglob("*"))
+    assert not any(path.is_file() for path in output.rglob("*"))
+    assert not any(path.name.startswith(".") and ".tmp." in path.name for path in tmp_path.rglob("*"))
+
+
+def test_move_file_destination_race_is_no_clobber(tmp_path):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = source_root / "lesson.mp4"
+    target = target_root / "Season 1" / "lesson.mp4"
+    source.write_bytes(b"source-bytes")
+    target.parent.mkdir()
+    target.write_bytes(b"raced-bytes")
+
+    organizer = _organizer()
+    assert organizer._move_file(
+        str(source),
+        str(target),
+        source_root=str(source_root),
+        target_root=str(target_root),
+    ) is False
+    assert source.read_bytes() == b"source-bytes"
+    assert target.read_bytes() == b"raced-bytes"
+    assert not any(path.name.startswith(".") and ".tmp." in path.name for path in target_root.rglob("*"))
+
+
+def test_move_file_without_bound_roots_fails_closed(tmp_path):
+    source = tmp_path / "source.mp4"
+    target = tmp_path / "target" / "lesson.mp4"
+    source.write_bytes(b"source-bytes")
+
+    organizer = _organizer()
+    assert organizer._move_file(str(source), str(target), source_root=None, target_root=None) is False
+    assert source.read_bytes() == b"source-bytes"
+    assert not target.exists()
+    assert not target.parent.exists()
+
+
+def test_move_file_exdev_copy_preserves_metadata_and_cleans_publish_error(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = source_root / "lesson.mp4"
+    target = target_root / "Season 1" / "lesson.mp4"
+    source.write_bytes(b"cross-filesystem-bytes")
+    source.chmod(0o640)
+    source_atime_ns = 1_650_000_000_123_456_789
+    source_mtime_ns = 1_650_000_100_123_456_789
+    os.utime(source, ns=(source_atime_ns, source_mtime_ns))
+
+    organizer = _organizer()
+    original_link = os.link
+    link_calls = {"count": 0}
+
+    def exdev_once(src: str, dst: str, **kwargs: object) -> None:
+        link_calls["count"] += 1
+        if link_calls["count"] == 1:
+            raise OSError(errno.EXDEV, "cross-device link")
+        original_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "link", exdev_once)
+    assert organizer._move_file(
+        str(source),
+        str(target),
+        source_root=str(source_root),
+        target_root=str(target_root),
+    ) is True
+    assert not source.exists()
+    target_stat = target.stat()
+    assert target.read_bytes() == b"cross-filesystem-bytes"
+    assert stat.S_IMODE(target_stat.st_mode) == 0o640
+    assert target_stat.st_atime_ns == source_atime_ns
+    assert target_stat.st_mtime_ns == source_mtime_ns
+    assert not any(path.name.startswith(".") and ".tmp." in path.name for path in target_root.rglob("*"))
+
+    error_source = source_root / "error.mp4"
+    error_target = target_root / "Season 1" / "error.mp4"
+    error_source.write_bytes(b"must-remain")
+    link_calls["count"] = 0
+
+    def exdev_publish_error(src: str, dst: str, **kwargs: object) -> None:
+        link_calls["count"] += 1
+        if link_calls["count"] == 1:
+            raise OSError(errno.EXDEV, "cross-device link")
+        raise OSError(errno.EIO, "publish failure")
+
+    monkeypatch.setattr(os, "link", exdev_publish_error)
+    assert organizer._move_file(
+        str(error_source),
+        str(error_target),
+        source_root=str(source_root),
+        target_root=str(target_root),
+    ) is False
+    assert error_source.read_bytes() == b"must-remain"
+    assert not error_target.exists()
+    assert not any(path.name.startswith(".") and ".tmp." in path.name for path in target_root.rglob("*"))
+
+
+def test_move_file_source_replacement_at_stage_boundary_is_restored_without_success(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    external_root = tmp_path / "external"
+    source_root.mkdir()
+    target_root.mkdir()
+    external_root.mkdir()
+    source = source_root / "lesson.mp4"
+    backup = source_root / "lesson.safe-backup.mp4"
+    external = external_root / "outside.mp4"
+    target = target_root / "lesson.mp4"
+    source.write_bytes(b"safe-source")
+    external.write_bytes(b"external-bytes")
+
+    original_rename = os.rename
+    swapped = {"value": False}
+
+    def replace_before_stage(src: str, dst: str, **kwargs: object) -> None:
+        if not swapped["value"] and kwargs.get("src_dir_fd") is not None:
+            source.replace(backup)
+            source.symlink_to(external)
+            swapped["value"] = True
+        original_rename(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "rename", replace_before_stage)
+    organizer = _organizer()
+
+    assert organizer._move_file(
+        str(source), str(target), source_root=str(source_root), target_root=str(target_root)
+    ) is False
+    assert swapped["value"] is True
+    assert backup.read_bytes() == b"safe-source"
+    assert source.is_symlink()
+    assert external.read_bytes() == b"external-bytes"
+    assert not os.path.lexists(target)
+    assert not list(source_root.glob(".courseorganizer-stage*"))
+    assert not list(target_root.rglob("*.tmp.*"))
+
+
+def test_process_course_rejects_bound_real_directory_root_replacement(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    incoming.mkdir()
+    output.mkdir()
+    course = incoming / "Course"
+    course.mkdir()
+    source = course / "lesson.mp4"
+    source.write_bytes(b"safe-source")
+
+    organizer = _organizer()
+    organizer.save_data(
+        organizer._state_key("Course"),
+        {
+            "signature": organizer._coerce_signature(organizer._snapshot_signature(str(course))),
+            "stable_count": 1,
+        },
+    )
+    original_move = organizer._move_file
+    replacement = tmp_path / "course-replacement"
+    swapped = {"value": False}
+
+    def replace_root_then_move(*args: object, **kwargs: object) -> bool:
+        if not swapped["value"]:
+            course.rename(replacement)
+            course.mkdir()
+            swapped["value"] = True
+        return original_move(*args, **kwargs)
+
+    monkeypatch.setattr(organizer, "_move_file", replace_root_then_move)
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert swapped["value"] is True
+    assert (replacement / "lesson.mp4").read_bytes() == b"safe-source"
+    assert not any(path.is_file() for path in output.rglob("*"))
+    assert not list(replacement.glob(".courseorganizer-stage*"))
+
+
+def test_move_file_exdev_clears_special_bits_on_destination(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = source_root / "lesson.mp4"
+    target = target_root / "Season 1" / "lesson.mp4"
+    source.write_bytes(b"special-mode")
+    source.chmod(0o6750)
+    os.utime(source, ns=(1_650_000_000_123_456_789, 1_650_000_100_123_456_789))
+
+    original_link = os.link
+    calls = {"count": 0}
+
+    def exdev_once(src: str, dst: str, **kwargs: object) -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OSError(errno.EXDEV, "cross-device link")
+        original_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "link", exdev_once)
+    organizer = _organizer()
+    assert organizer._move_file(
+        str(source), str(target), source_root=str(source_root), target_root=str(target_root)
+    ) is True
+    target_stat = target.stat()
+    assert stat.S_IMODE(target_stat.st_mode) == 0o750
+    assert target_stat.st_mtime_ns == 1_650_000_100_123_456_789
+    assert not source.exists()
+    assert not list(target_root.rglob("*.tmp.*"))
+
+
+def test_move_file_failed_same_fs_validation_preserves_raced_target(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = source_root / "lesson.mp4"
+    target = target_root / "lesson.mp4"
+    source.write_bytes(b"safe-source")
+
+    original_link = os.link
+    raced = {"value": False}
+
+    def publish_then_race(src: str, dst: str, **kwargs: object) -> None:
+        original_link(src, dst, **kwargs)
+        if not raced["value"] and dst == target.name:
+            raced["value"] = True
+            os.unlink(target)
+            target.write_bytes(b"raced-target")
+
+    monkeypatch.setattr(os, "link", publish_then_race)
+    organizer = _organizer()
+    assert organizer._move_file(
+        str(source), str(target), source_root=str(source_root), target_root=str(target_root)
+    ) is False
+    assert raced["value"] is True
+    assert source.read_bytes() == b"safe-source"
+    assert target.read_bytes() == b"raced-target"
+    assert not list(source_root.glob(".courseorganizer-stage*"))
+    assert not list(target_root.rglob("*.tmp.*"))
+
+
+def test_process_course_commit_cleanup_failure_restores_from_published_descriptor(
+    tmp_path, monkeypatch
+):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    incoming.mkdir()
+    output.mkdir()
+    course = incoming / "Course"
+    course.mkdir()
+    first = course / "a.mp4"
+    second = course / "b.mp4"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    organizer = _organizer()
+    organizer.save_data(
+        organizer._state_key("Course"),
+        {
+            "signature": organizer._coerce_signature(organizer._snapshot_signature(str(course))),
+            "stable_count": 1,
+        },
+    )
+    first_target = output / "Course" / "Season 1" / "Course - S01E001.mp4"
+    second_target = output / "Course" / "Season 1" / "Course - S01E002.mp4"
+    original_unlink = organizer._unlink_if_identity
+    stage_cleanups = []
+    failure_injected = {"value": False}
+
+    def fail_second_staged_cleanup(parent_fd, name, expected):
+        prefix, separator, _ = name.partition("-")
+        is_stage_name = separator and len(prefix) == 8 and all(
+            character in "0123456789abcdef" for character in prefix
+        )
+        if is_stage_name:
+            stage_cleanups.append(name)
+            if len(stage_cleanups) == 2 and not failure_injected["value"]:
+                first_target.unlink()
+                first_target.write_bytes(b"raced-target")
+                failure_injected["value"] = True
+                return False
+        return original_unlink(parent_fd, name, expected)
+
+    monkeypatch.setattr(organizer, "_unlink_if_identity", fail_second_staged_cleanup)
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert failure_injected["value"] is True
+    assert stage_cleanups[:2] == ["00000001-a.mp4", "00000002-b.mp4"]
+    assert first.read_bytes() == b"first"
+    assert second.read_bytes() == b"second"
+    assert first_target.read_bytes() == b"raced-target"
+    assert not second_target.exists()
+    assert not list(course.glob(".courseorganizer-stage*"))
+    assert not list(output.rglob("*.tmp.*"))
+
+
+def test_process_course_later_plan_failure_restores_earlier_sources_and_targets(
+    tmp_path, monkeypatch
+):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    incoming.mkdir()
+    output.mkdir()
+    course = incoming / "Course"
+    course.mkdir()
+    first = course / "a.mp4"
+    second = course / "b.mp4"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    organizer = _organizer()
+    organizer.save_data(
+        organizer._state_key("Course"),
+        {
+            "signature": organizer._coerce_signature(organizer._snapshot_signature(str(course))),
+            "stable_count": 1,
+        },
+    )
+    original_move = organizer._move_file
+    calls = {"count": 0}
+
+    def fail_second(*args: object, **kwargs: object) -> bool:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            return False
+        return original_move(*args, **kwargs)
+
+    monkeypatch.setattr(organizer, "_move_file", fail_second)
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert calls["count"] == 2
+    assert first.read_bytes() == b"first"
+    assert second.read_bytes() == b"second"
+    assert not any(path.is_file() for path in output.rglob("*"))
+    assert not list(course.glob(".courseorganizer-stage*"))
+    assert not list(output.rglob("*.tmp.*"))
+
+
+def test_run_skips_when_output_roots_are_nested(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    tv_output = tmp_path / "tv"
+    movie_output = tv_output / "movie"
+    children_output = tmp_path / "children"
+
+    incoming.mkdir()
+    movie_output.mkdir(parents=True)
+    children_output.mkdir()
+
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "tv_output": str(tv_output),
+            "movie_output": str(movie_output),
+            "children_output": str(children_output),
+        }
+    )
+
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+    called = []
+
+    def blocked_course(*args: object, **kwargs: object) -> bool:
+        called.append(True)
+        return True
+
+    monkeypatch.setattr(organizer, "_process_course", blocked_course)
+
+    organizer._run()
+
+    assert called == []
+    assert not list(movie_output.iterdir())
+    assert not list(children_output.iterdir())
+    assert any("output paths must not contain one another" in err for err in logger.errors)
+
+
+def test_run_allows_distinct_existing_output_roots_for_non_nested_case(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    tv_output = tmp_path / "tv"
+    movie_output = tmp_path / "movie"
+    children_output = tmp_path / "children"
+
+    incoming.mkdir()
+    tv_output.mkdir()
+    movie_output.mkdir()
+    children_output.mkdir()
+
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "tv_output": str(tv_output),
+            "movie_output": str(movie_output),
+            "children_output": str(children_output),
+        }
+    )
+
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+    called = []
+
+    def blocked_course(*args: object, **kwargs: object) -> bool:
+        called.append(True)
+        return True
+
+    monkeypatch.setattr(organizer, "_process_course", blocked_course)
+
+    organizer._run()
+
+    assert called == [True]
+    assert not logger.errors
+
+
+def test_run_logs_scan_started_and_scan_completed_with_counts_and_no_path_leakage(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    tv_output = tmp_path / "tv"
+    movie_output = tmp_path / "movie"
+    children_output = tmp_path / "children"
+    output_roots = [tv_output, movie_output, children_output]
+
+    incoming.mkdir()
+    for output_root in output_roots:
+        output_root.mkdir()
+
+    for course_name in ("CourseA", "CourseB"):
+        course = incoming / course_name
+        course.mkdir()
+        (course / "lesson.mp4").write_bytes(f"{course_name}".encode())
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "tv_output": str(tv_output),
+            "movie_output": str(movie_output),
+            "children_output": str(children_output),
+            "naming_mode": "apply",
+        }
+    )
+
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    def simulated_process_course(course_name: str, *args: object, **kwargs: object) -> bool:
+        return course_name == "CourseA"
+
+    monkeypatch.setattr(organizer, "_process_course", simulated_process_course)
+
+    organizer._run()
+    organizer._run(force=True)
+
+    scan_started = [
+        msg for msg in logger.debugs if "CourseOrganizer[event=scan_started]" in msg
+    ]
+    assert len(scan_started) == 2
+    assert any("trigger=scheduled" in msg and "mode=apply" in msg for msg in scan_started)
+    assert any("trigger=manual" in msg and "mode=apply" in msg for msg in scan_started)
+
+    scan_completed = [
+        msg for msg in logger.infos if "CourseOrganizer[event=scan_completed]" in msg
+    ]
+    assert len(scan_completed) == 2
+    assert any("trigger=scheduled" in msg for msg in scan_completed)
+    assert any("trigger=manual" in msg for msg in scan_completed)
+    for message in scan_completed:
+        counts = _event_counts_from_log(message)
+        assert counts["scanned"] == 2
+        assert counts["moved"] == 1
+    all_logged = logger.infos + logger.debugs
+    assert not any(str(root) in msg for root in output_roots for msg in all_logged)
+
+
+def test_run_logs_item_error_with_item_keys(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    tv_output = tmp_path / "tv"
+    movie_output = tmp_path / "movie"
+    children_output = tmp_path / "children"
+
+    incoming.mkdir()
+    tv_output.mkdir()
+    movie_output.mkdir()
+    children_output.mkdir()
+
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "incoming": str(incoming),
+            "tv_output": str(tv_output),
+            "movie_output": str(movie_output),
+            "children_output": str(children_output),
+            "naming_mode": "off",
+        }
+    )
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    exception_payload = f"boom:{course.resolve()}/private-token"
+
+    def failed_course(*args: object, **kwargs: object) -> bool:
+        raise RuntimeError(exception_payload)
+
+    monkeypatch.setattr(organizer, "_process_course", failed_course)
+
+    organizer._run()
+
+    structured_errors = [msg for msg in logger.infos if "CourseOrganizer[event=item_error]" in msg]
+    assert structured_errors
+    assert any(
+        "CourseOrganizer[event=item_error] item_course=Course" in msg
+        and "item_reason=RuntimeError" in msg
+        and "item_error=exception" in msg
+        for msg in structured_errors
+    )
+
+    all_logged = logger.infos + logger.errors + logger.debugs
+    item_lines = [msg for msg in all_logged if "item_" in msg]
+    assert item_lines
+    assert all("CourseOrganizer[event=" in msg for msg in item_lines)
+    assert all(exception_payload not in msg for msg in all_logged)
+    assert all(str(course.resolve()) not in msg for msg in all_logged)
+
+
+def test_process_course_logs_second_incomplete_check_event(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    incoming.mkdir()
+    output.mkdir()
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    organizer = CourseOrganizer(config={"enabled": True, "naming_mode": "off"})
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    calls = {"count": 0}
+
+    def delayed_incomplete(_course_path: str) -> bool:
+        calls["count"] += 1
+        return calls["count"] in {1, 4}
+
+    monkeypatch.setattr(organizer, "_has_incomplete_file", delayed_incomplete)
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert organizer._process_course("Course", str(course), str(output)) is False
+
+    assert any(
+        "CourseOrganizer[event=incomplete_blocked] item_phase=initial item_course=Course" in msg
+        for msg in logger.debugs
+    )
+    assert any(
+        "CourseOrganizer[event=incomplete_blocked] item_phase=final item_course=Course" in msg
+        for msg in logger.debugs
+    )
+
+
+def test_process_course_logs_no_media_event(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    incoming.mkdir()
+    output.mkdir()
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "notes.txt").write_text("notes")
+
+    organizer = CourseOrganizer(config={"enabled": True, "naming_mode": "off"})
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert organizer._process_course("Course", str(course), str(output)) is False
+
+    assert any("CourseOrganizer[event=no_media]" in msg for msg in logger.debugs)
+
+
+def test_process_course_logs_preview_event_without_moving(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    incoming.mkdir()
+    output.mkdir()
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    organizer = CourseOrganizer(config={"enabled": True, "naming_mode": "preview"})
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    preview_message = next(msg for msg in logger.infos if "CourseOrganizer[event=preview]" in msg)
+    assert "CourseOrganizer[event=preview] item_course=Course" in preview_message
+    assert "item_final=" in preview_message
+    assert "item_library=" in preview_message
+    assert not list(output.iterdir())
+
+
+def test_process_course_logs_naming_blocked_event(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    incoming.mkdir()
+    output.mkdir()
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    organizer = CourseOrganizer(config={"enabled": True, "naming_mode": "apply"})
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    def blocked_naming(*args: object, **kwargs: object) -> MODULE.NamingDecision:
+        return MODULE.NamingDecision(
+            status="uncertain",
+            raw_title="Course",
+            local_title="Course",
+            final_root="Course",
+            final_prefix="Course",
+        )
+
+    monkeypatch.setattr(organizer, "_resolve_naming", blocked_naming)
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert any(
+        "CourseOrganizer[event=naming_blocked] item_course=Course item_reason=uncertain" in msg
+        for msg in logger.debugs
+    )
+
+
+def test_process_course_logs_library_hold_event(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    tv_output = tmp_path / "tv"
+    movie_output = tmp_path / "movie"
+    children_output = tmp_path / "children"
+    incoming.mkdir()
+    tv_output.mkdir()
+    movie_output.mkdir()
+    children_output.mkdir()
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    organizer = CourseOrganizer(
+        config={
+            "enabled": True,
+            "naming_mode": "apply",
+            "incoming": str(incoming),
+            "tv_output": str(tv_output),
+            "movie_output": str(movie_output),
+            "children_output": str(children_output),
+        },
+    )
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    def hold_route(*args: object, **kwargs: object) -> MODULE.LibraryRouteResult:
+        return MODULE.LibraryRouteResult(
+            accepted=False,
+            library="hold",
+            confidence=0.0,
+            reason_codes=("hold",),
+            error="",
+        )
+
+    class _ResolverStub:
+        def resolve(self, *args: object, **kwargs: object) -> MODULE.NamingDecision:
+            course_name = str(args[0]) if args else "Course"
+            return MODULE.NamingDecision(
+                status="auto_external",
+                raw_title=course_name,
+                local_title=course_name,
+                final_root=course_name,
+                final_prefix=course_name,
+            )
+
+        def record_decision(self, *args: object, **kwargs: object) -> MODULE.NamingDecision:
+            return args[0]
+
+    monkeypatch.setattr(organizer, "_resolve_library_route", hold_route)
+    monkeypatch.setattr(organizer, "_get_resolver", lambda: _ResolverStub())
+
+    assert organizer._process_course("Course", str(course)) is False
+    assert organizer._process_course("Course", str(course)) is False
+    library_hold = next(
+        msg for msg in logger.debugs if "CourseOrganizer[event=library_hold]" in msg
+    )
+    assert "CourseOrganizer[event=library_hold] item_course=Course" in library_hold
+    assert "item_confidence=0.000" in library_hold
+    assert "item_reasons=hold" in library_hold
+
+
+def test_process_course_logs_legacy_conflict_event(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    incoming.mkdir()
+    output.mkdir()
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+    (output / "Course").mkdir()
+
+    organizer = CourseOrganizer(
+        config={"enabled": True, "naming_mode": "apply"},
+    )
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    def renamed_target(*args: object, **kwargs: object) -> MODULE.NamingDecision:
+        return MODULE.NamingDecision(
+            status="auto_external",
+            raw_title="Course",
+            local_title="Course",
+            final_root="Renamed Course",
+            final_prefix="Renamed Course",
+        )
+
+    class _ResolverStub:
+        def resolve(self, *args: object, **kwargs: object) -> MODULE.NamingDecision:
+            raise AssertionError("resolve should not be called when naming is overridden")
+
+        def record_decision(self, *args: object, **kwargs: object) -> MODULE.NamingDecision:
+            return args[0]
+
+        def record_output_conflict(self, *args: object, **kwargs: object) -> MODULE.NamingDecision:
+            return args[0]
+
+    monkeypatch.setattr(organizer, "_resolve_naming", renamed_target)
+    monkeypatch.setattr(organizer, "_get_resolver", lambda: _ResolverStub())
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    legacy_conflict = next(
+        msg for msg in logger.debugs if "CourseOrganizer[event=legacy_conflict]" in msg
+    )
+    assert "CourseOrganizer[event=legacy_conflict] item_course=Course" in legacy_conflict
+    assert "item_final=Renamed Course" in legacy_conflict
+    assert "item_library=" in legacy_conflict
+
+
+def test_process_course_logs_move_started_and_completed_events(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    incoming.mkdir()
+    output.mkdir()
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    organizer = CourseOrganizer(config={"enabled": True, "naming_mode": "off"})
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    assert organizer._process_course("Course", str(course), str(output)) is False
+    assert organizer._process_course("Course", str(course), str(output)) is True
+    move_started = next(msg for msg in logger.infos if "CourseOrganizer[event=move_started]" in msg)
+    assert "CourseOrganizer[event=move_started] item_course=Course" in move_started
+    assert "item_final=Course" in move_started
+    assert "item_library=legacy" in move_started
+    assert "item_media_count=1" in move_started
+    assert any(
+        "CourseOrganizer[event=move_completed] item_course=Course" in msg
+        and "item_final=Course" in msg
+        and "item_library=legacy" in msg
+        and "item_moved=1" in msg
+        and "item_subtitles=0" in msg
+        for msg in logger.infos
+    )
