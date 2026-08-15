@@ -1,4 +1,4 @@
-# MoviePilot 课程自动整理（V2）1.5.2
+# MoviePilot 课程自动整理（V2）1.5.3
 
 ### 更新说明
 
@@ -47,7 +47,7 @@
 ## 四、配置项
 
 - `enabled`：是否开启。
-- `run_once`：启用时在本次初始化后异步执行一次后复位。
+- `run_once`：请求排队期间保持为 true，在异步回调取得执行权或显式停止时复位为 false；即时配置重载不会取消已排队回调，重复请求只保留一次。
 - `incoming`：待整理源目录。
 - `tv_output`：电视剧目标根目录，默认 `/volume1/TV`。
 - `movie_output`：电影目标根目录，默认 `/volume1/Movies`。

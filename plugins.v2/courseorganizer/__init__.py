@@ -102,7 +102,7 @@ class CourseOrganizer(_PluginBase):
     plugin_config_prefix = "courseorganizer_"
     auth_level = 1
     plugin_order = 90
-    plugin_version = "1.5.2"
+    plugin_version = "1.5.3"
     plugin_desc = "稳定后识别、分类并整理到电视剧、电影或儿童媒体库"
     plugin_author = "OpenAI"
     plugin_icon = "icons/courseorganizer.svg"
@@ -117,7 +117,13 @@ class CourseOrganizer(_PluginBase):
     DEFAULT_CHILDREN_OUTPUT = "/volume1/儿童"
 
     _thread_lock = threading.Lock()
+    # MoviePilot update_config persists only; this lock linearizes persistence and cancellation.
+    _run_once_lock = threading.Lock()
     _run_once_timer: Optional[threading.Timer] = None
+    _run_once_owner: Optional["CourseOrganizer"] = None
+    _run_once_claimed = False
+    _run_once_generation = 0
+    _run_once_token: Optional[int] = None
 
     def __init__(
         self,
@@ -134,6 +140,7 @@ class CourseOrganizer(_PluginBase):
         self._resolver_signature: Tuple[Any, ...] = ()
         self._library_classifier: Optional[MoviePilotLibraryClassifier] = None
         self._logger = _logger
+        self._run_config_local = threading.local()
 
     def _load_plugin_data(self, key: str, default: Any) -> Any:
         try:
@@ -157,8 +164,8 @@ class CourseOrganizer(_PluginBase):
         )
 
     def init_plugin(self, config: Optional[Dict[str, Any]] = None):
-        self.stop_service()
         self._config_snapshot = self._normalize_config(config)
+        plugin_cls = type(self)
 
         if bool(self._config_snapshot.get("naming_clear_cache_once")):
             self._build_resolver(self._config_snapshot).clear()
@@ -169,15 +176,76 @@ class CourseOrganizer(_PluginBase):
             self._config_snapshot = reset
 
         if self._config_snapshot.get("run_once"):
-            self._logger.info("CourseOrganizer: scheduling one-time run asynchronously")
-            reset_config = dict(self._config_snapshot)
-            reset_config["run_once"] = False
-            self._persist_config(reset_config)
-            self._config_snapshot = reset_config
+            with plugin_cls._run_once_lock:
+                timer = plugin_cls._run_once_timer
+                pending_config = dict(self._config_snapshot)
+                pending_config["run_once"] = True
+                if timer is not None and timer.is_alive():
+                    if not self._persist_config(pending_config):
+                        self._logger.error(
+                            "CourseOrganizer[event=run_once_persist_failed] phase=pending"
+                        )
+                        return
+                    plugin_cls._run_once_owner = self
+                    self._config_snapshot = pending_config
+                    self._logger.info(
+                        "CourseOrganizer[event=run_once_coalesced] pending=true"
+                    )
+                    return
 
-            self._run_once_timer = threading.Timer(0.2, self._run_once_and_reset)
-            self._run_once_timer.daemon = True
-            self._run_once_timer.start()
+                if not self._persist_config(pending_config):
+                    plugin_cls._invalidate_run_once_locked()
+                    self._logger.error(
+                        "CourseOrganizer[event=run_once_persist_failed] phase=pending"
+                    )
+                    return
+                self._config_snapshot = pending_config
+                plugin_cls._run_once_owner = self
+                plugin_cls._run_once_claimed = False
+                plugin_cls._run_once_generation += 1
+                token = plugin_cls._run_once_generation
+                plugin_cls._run_once_token = token
+                self._logger.info(
+                    "CourseOrganizer[event=run_once_scheduled] delay=0.2"
+                )
+                timer = None
+                try:
+                    timer = threading.Timer(
+                        0.2,
+                        lambda token=token: plugin_cls._run_once_dispatch(token),
+                    )
+                    timer.daemon = True
+                    plugin_cls._run_once_timer = timer
+                    timer.start()
+                except Exception as exc:
+                    plugin_cls._run_once_timer = None
+                    plugin_cls._run_once_owner = None
+                    plugin_cls._run_once_claimed = False
+                    plugin_cls._run_once_token = None
+                    if timer is not None:
+                        try:
+                            timer.cancel()
+                        except Exception:
+                            pass
+                    self._logger.error(
+                        "CourseOrganizer[event=run_once_schedule_failed] phase=%s error=%s",
+                        "start" if timer is not None else "construct",
+                        exc.__class__.__name__,
+                    )
+            return
+
+        with plugin_cls._run_once_lock:
+            timer = plugin_cls._run_once_timer
+            if timer is not None and timer.is_alive():
+                pending_config = dict(self._config_snapshot)
+                pending_config["run_once"] = True
+                if not self._persist_config(pending_config):
+                    self._logger.error(
+                        "CourseOrganizer[event=run_once_persist_failed] phase=pending"
+                    )
+                    return
+                plugin_cls._run_once_owner = self
+                self._config_snapshot = pending_config
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -720,10 +788,26 @@ class CourseOrganizer(_PluginBase):
         ]
 
     def stop_service(self) -> None:
-        timer = self._run_once_timer
-        if timer is not None and timer.is_alive():
-            timer.cancel()
-        self._run_once_timer = None
+        plugin_cls = type(self)
+        with plugin_cls._run_once_lock:
+            owner = plugin_cls._run_once_owner
+            plugin_cls._invalidate_run_once_locked()
+            reset_target = owner or self
+            reset_config = reset_target._normalize_config(reset_target._get_config())
+            reset_config["run_once"] = False
+            if not reset_target._persist_config(reset_config):
+                reset_target._logger.error(
+                    "CourseOrganizer[event=run_once_persist_failed] phase=stop"
+                )
+            reset_target._config_snapshot = reset_config
+            if reset_target is not self:
+                reset_config = self._normalize_config(self._get_config())
+                reset_config["run_once"] = False
+                if not self._persist_config(reset_config):
+                    self._logger.error(
+                        "CourseOrganizer[event=run_once_persist_failed] phase=stop"
+                    )
+                self._config_snapshot = reset_config
 
     def run(self) -> None:
         with self._thread_lock:
@@ -834,15 +918,58 @@ class CourseOrganizer(_PluginBase):
             moved,
         )
 
-    def _run_once_and_reset(self) -> None:
-        with self._thread_lock:
+    @classmethod
+    def _run_once_dispatch(cls, token: int) -> None:
+        cls._run_once_and_reset(token)
+
+    @classmethod
+    def _invalidate_run_once_locked(cls) -> None:
+        timer = cls._run_once_timer
+        if timer is not None:
             try:
-                self._run(force=True)
-            finally:
-                latest_config = self._normalize_config(self._get_config())
+                timer.cancel()
+            except Exception:
+                pass
+        cls._run_once_timer = None
+        cls._run_once_owner = None
+        cls._run_once_claimed = False
+        cls._run_once_generation += 1
+        cls._run_once_token = None
+
+    @classmethod
+    def _run_once_and_reset(cls, token: Optional[int] = None) -> None:
+        with cls._thread_lock:
+            with cls._run_once_lock:
+                if token is None:
+                    token = cls._run_once_token
+                if token is None or cls._run_once_token != token:
+                    return
+                owner = cls._run_once_owner
+                if owner is None or cls._run_once_claimed:
+                    return
+                cls._run_once_claimed = True
+                latest_config = owner._normalize_config(owner._get_config())
                 latest_config["run_once"] = False
-                self._persist_config(latest_config)
-                self._config_snapshot = latest_config
+                if not owner._persist_config(latest_config):
+                    cls._invalidate_run_once_locked()
+                    owner._logger.error(
+                        "CourseOrganizer[event=run_once_persist_failed] phase=claim"
+                    )
+                    return
+                owner._config_snapshot = latest_config
+                owner._run_config_local.config = dict(latest_config)
+                cls._run_once_timer = None
+                cls._run_once_owner = None
+                cls._run_once_claimed = False
+                cls._run_once_generation += 1
+                cls._run_once_token = None
+            try:
+                owner._run(force=True)
+            finally:
+                try:
+                    del owner._run_config_local.config
+                except AttributeError:
+                    pass
 
     def _resolve_naming(
         self,
@@ -2620,6 +2747,9 @@ class CourseOrganizer(_PluginBase):
             return cls.DEFAULT_INTERVAL
 
     def _get_config(self) -> Dict[str, Any]:
+        run_config = getattr(self._run_config_local, "config", None)
+        if isinstance(run_config, dict):
+            return dict(run_config)
         try:
             raw = self.get_config()
             if not isinstance(raw, dict):
@@ -2628,15 +2758,18 @@ class CourseOrganizer(_PluginBase):
         except Exception:
             return self._normalize_config()
 
-    def _persist_config(self, config: Dict[str, Any]) -> None:
+    def _persist_config(self, config: Dict[str, Any]) -> bool:
         if not hasattr(self, "update_config"):
-            return
+            return False
         try:
-            self.update_config(config)
-            return
+            result = self.update_config(config)
+            return result is not False
         except TypeError:
             pass
-        try:
-            self.update_config(config=config)
         except Exception:
-            pass
+            return False
+        try:
+            result = self.update_config(config=config)
+            return result is not False
+        except Exception:
+            return False

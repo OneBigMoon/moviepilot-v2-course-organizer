@@ -17,7 +17,7 @@ def test_plugin_version_matches_package_metadata():
     package_path = Path(__file__).parents[1] / "package.v2.json"
     package = json.loads(package_path.read_text(encoding="utf-8"))
 
-    assert CourseOrganizer.plugin_version == "1.5.2"
+    assert CourseOrganizer.plugin_version == "1.5.3"
     assert package["CourseOrganizer"]["version"] == CourseOrganizer.plugin_version
 
 
@@ -715,6 +715,86 @@ class _RunLogger:
         self.debugs.append(self._format_messages(message, *args[1:], **kwargs))
 
 
+class _RunOnceFakeTimer:
+    created = []
+
+    def __init__(self, interval, callback):
+        self.interval = interval
+        self.callback = callback
+        self.daemon = False
+        self.started = False
+        self.finished = False
+        self.cancelled = False
+        self.callback_started = threading.Event()
+        self.__class__.created.append(self)
+
+    def start(self):
+        self.started = True
+
+    def is_alive(self):
+        return self.started and not self.finished and not self.cancelled
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        if not self.is_alive():
+            return False
+        self.callback_started.set()
+        try:
+            self.callback()
+            return True
+        finally:
+            self.finished = True
+
+
+def _filesystem_fingerprint(root: Path):
+    paths = [root, *root.rglob("*")]
+    return [
+        (
+            path.relative_to(root).as_posix(),
+            path.is_dir(),
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in sorted(paths)
+    ]
+
+
+def _preview_run_once_case(tmp_path):
+    incoming = tmp_path / "incoming"
+    tv_output = tmp_path / "tv"
+    movie_output = tmp_path / "movie"
+    children_output = tmp_path / "children"
+    for directory in (incoming, tv_output, movie_output, children_output):
+        directory.mkdir()
+
+    course = incoming / "Course"
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"video")
+
+    config = {
+        "enabled": False,
+        "run_once": True,
+        "incoming": str(incoming),
+        "tv_output": str(tv_output),
+        "movie_output": str(movie_output),
+        "children_output": str(children_output),
+        "naming_mode": "preview",
+    }
+    roots = (incoming, tv_output, movie_output, children_output)
+    return config, roots
+
+
+def _seed_stable_course(organizer, incoming):
+    course = incoming / "Course"
+    organizer.save_data(
+        organizer._state_key("Course"),
+        {"signature": organizer._snapshot_signature(str(course)), "stable_count": 1},
+    )
+
+
 def _event_counts_from_log(message: str) -> dict[str, int]:
     values = {}
     for token in str(message).split():
@@ -759,56 +839,36 @@ def test_run_once_preview_lifecycle_is_fail_closed_and_resets(tmp_path, monkeypa
         "naming_clear_cache_once": False,
     }
 
-    class FakeTimer:
-        created = []
-
-        def __init__(self, interval, callback):
-            self.interval = interval
-            self.callback = callback
-            self.daemon = False
-            self.started = False
-            self.cancelled = False
-            self.__class__.created.append(self)
-
-        def start(self):
-            self.started = True
-
-        def is_alive(self):
-            return self.started and not self.cancelled
-
-        def cancel(self):
-            self.cancelled = True
-
-    def fingerprint(root):
-        paths = [root, *root.rglob("*")]
-        return [
-            (
-                path.relative_to(root).as_posix(),
-                path.is_dir(),
-                path.stat().st_size,
-                path.stat().st_mtime_ns,
-                path.read_bytes() if path.is_file() else None,
-            )
-            for path in sorted(paths)
-        ]
-
     roots = (incoming, tv_output, movie_output, children_output)
-    before = {root.name: fingerprint(root) for root in roots}
+    before = {root.name: _filesystem_fingerprint(root) for root in roots}
     organizer = CourseOrganizer(config=dict(config))
     logger = _RunLogger()
     monkeypatch.setattr(organizer, "_logger", logger)
-    monkeypatch.setattr(MODULE.threading, "Timer", FakeTimer)
+    organizer.save_data(
+        organizer._state_key("Course"),
+        {"signature": organizer._snapshot_signature(str(course)), "stable_count": 1},
+    )
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
 
     organizer.init_plugin(dict(config))
 
-    assert len(FakeTimer.created) == 1
-    timer = FakeTimer.created[0]
+    assert len(_RunOnceFakeTimer.created) == 1
+    timer = _RunOnceFakeTimer.created[0]
     assert timer.interval == pytest.approx(0.2)
     assert timer.started is True
-    expected_config = {**config, "run_once": False}
-    assert organizer._get_config() == expected_config
+    assert any(
+        "CourseOrganizer[event=run_once_scheduled] delay=0.2" in message
+        for message in logger.infos
+    )
+    pending_config = {**config, "run_once": True}
+    assert organizer._get_config() == pending_config
 
-    timer.callback()
+    organizer.init_plugin({**config, "run_once": False})
+    assert len(_RunOnceFakeTimer.created) == 1
+    assert timer.cancelled is False
+    assert organizer._get_config() == pending_config
+    assert timer.fire() is True
 
     scan_started = [
         message
@@ -829,8 +889,511 @@ def test_run_once_preview_lifecycle_is_fail_closed_and_resets(tmp_path, monkeypa
     all_messages = logger.errors + logger.infos + logger.debugs
     assert not any("CourseOrganizer[event=move_started]" in message for message in all_messages)
     assert not any("CourseOrganizer[event=move_completed]" in message for message in all_messages)
-    assert {root.name: fingerprint(root) for root in roots} == before
-    assert organizer._get_config() == expected_config
+    assert any("CourseOrganizer[event=preview]" in message for message in all_messages)
+    assert {root.name: _filesystem_fingerprint(root) for root in roots} == before
+    assert organizer._get_config() == {**config, "run_once": False}
+
+
+def test_run_once_repeated_true_reuses_live_timer(tmp_path, monkeypatch):
+    config, roots = _preview_run_once_case(tmp_path)
+    before = {root.name: _filesystem_fingerprint(root) for root in roots}
+    organizer = CourseOrganizer(config=dict(config))
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+
+    organizer.init_plugin(dict(config))
+    organizer.init_plugin(dict(config))
+
+    assert len(_RunOnceFakeTimer.created) == 1
+    timer = _RunOnceFakeTimer.created[0]
+    assert timer.cancelled is False
+    assert organizer._get_config()["run_once"] is True
+    assert any(
+        "CourseOrganizer[event=run_once_coalesced] pending=true" in message
+        for message in logger.infos
+    )
+
+    assert timer.fire() is True
+    assert sum("CourseOrganizer[event=scan_completed]" in message for message in logger.infos) == 1
+    assert organizer._get_config()["run_once"] is False
+    assert {root.name: _filesystem_fingerprint(root) for root in roots} == before
+
+
+def test_stop_service_cancels_pending_run_once_without_firing(tmp_path, monkeypatch):
+    config, roots = _preview_run_once_case(tmp_path)
+    before = {root.name: _filesystem_fingerprint(root) for root in roots}
+    organizer = CourseOrganizer(config=dict(config))
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+
+    organizer.init_plugin(dict(config))
+    timer = _RunOnceFakeTimer.created[0]
+    assert organizer._get_config()["run_once"] is True
+    organizer.stop_service()
+
+    assert timer.cancelled is True
+    assert timer.is_alive() is False
+    assert timer.fire() is False
+    assert organizer._get_config()["run_once"] is False
+    assert not any("CourseOrganizer[event=scan_completed]" in message for message in logger.infos)
+    assert {root.name: _filesystem_fingerprint(root) for root in roots} == before
+
+
+def test_run_once_cross_instance_uses_latest_owner_and_one_timer(tmp_path, monkeypatch):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_config, first_roots = _preview_run_once_case(first_root)
+    second_config, second_roots = _preview_run_once_case(second_root)
+    first_before = {root.name: _filesystem_fingerprint(root) for root in first_roots}
+    second_before = {root.name: _filesystem_fingerprint(root) for root in second_roots}
+
+    first = CourseOrganizer(config=dict(first_config))
+    second = CourseOrganizer(config=dict(second_config))
+    first_logger = _RunLogger()
+    second_logger = _RunLogger()
+    monkeypatch.setattr(first, "_logger", first_logger)
+    monkeypatch.setattr(second, "_logger", second_logger)
+    _seed_stable_course(second, second_root / "incoming")
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+
+    first.init_plugin(dict(first_config))
+    second.init_plugin(dict(second_config))
+
+    assert len(_RunOnceFakeTimer.created) == 1
+    assert type(second)._run_once_owner is second
+    assert second._get_config()["run_once"] is True
+    assert _RunOnceFakeTimer.created[0].fire() is True
+
+    assert not any("CourseOrganizer[event=scan_completed]" in message for message in first_logger.infos)
+    assert sum("CourseOrganizer[event=scan_completed]" in message for message in second_logger.infos) == 1
+    assert {root.name: _filesystem_fingerprint(root) for root in first_roots} == first_before
+    assert {root.name: _filesystem_fingerprint(root) for root in second_roots} == second_before
+    assert second._get_config()["run_once"] is False
+
+
+def test_run_once_cross_instance_stop_cancels_previous_timer(tmp_path, monkeypatch):
+    root = tmp_path / "case"
+    root.mkdir()
+    config, roots = _preview_run_once_case(root)
+    before = {path.name: _filesystem_fingerprint(path) for path in roots}
+    first = CourseOrganizer(config=dict(config))
+    second = CourseOrganizer(config={**config, "run_once": False})
+    first_logger = _RunLogger()
+    second_logger = _RunLogger()
+    monkeypatch.setattr(first, "_logger", first_logger)
+    monkeypatch.setattr(second, "_logger", second_logger)
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+
+    first.init_plugin(dict(config))
+    timer = _RunOnceFakeTimer.created[0]
+    second.stop_service()
+
+    assert timer.cancelled is True
+    assert timer.fire() is False
+    assert first._get_config()["run_once"] is False
+    assert second._get_config()["run_once"] is False
+    assert not any("CourseOrganizer[event=scan_completed]" in message for message in first_logger.infos)
+    assert not any("CourseOrganizer[event=scan_completed]" in message for message in second_logger.infos)
+    assert {path.name: _filesystem_fingerprint(path) for path in roots} == before
+
+
+def test_run_once_concurrent_true_requests_create_one_timer_and_one_scan(tmp_path, monkeypatch):
+    root = tmp_path / "case"
+    root.mkdir()
+    config, roots = _preview_run_once_case(root)
+    before = {path.name: _filesystem_fingerprint(path) for path in roots}
+    first = CourseOrganizer(config=dict(config))
+    second = CourseOrganizer(config=dict(config))
+    first_logger = _RunLogger()
+    second_logger = _RunLogger()
+    monkeypatch.setattr(first, "_logger", first_logger)
+    monkeypatch.setattr(second, "_logger", second_logger)
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+    persist_errors = []
+    start_barrier = threading.Barrier(2)
+
+    def init(organizer):
+        try:
+            start_barrier.wait(timeout=2)
+            organizer.init_plugin(dict(config))
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            persist_errors.append(exc)
+
+    threads = [threading.Thread(target=init, args=(organizer,)) for organizer in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert persist_errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(_RunOnceFakeTimer.created) == 1
+    assert _RunOnceFakeTimer.created[0].fire() is True
+    assert sum(
+        "CourseOrganizer[event=scan_completed]" in message
+        for logger in (first_logger, second_logger)
+        for message in logger.infos
+    ) == 1
+    assert {path.name: _filesystem_fingerprint(path) for path in roots} == before
+
+
+def test_run_once_stop_invalidates_callback_blocked_on_scan_lock(tmp_path, monkeypatch):
+    root = tmp_path / "case"
+    root.mkdir()
+    config, roots = _preview_run_once_case(root)
+    before = {path.name: _filesystem_fingerprint(path) for path in roots}
+    organizer = CourseOrganizer(config=dict(config))
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+
+    organizer.init_plugin(dict(config))
+    timer = _RunOnceFakeTimer.created[0]
+    assert CourseOrganizer._thread_lock.acquire(timeout=1)
+    fire_errors = []
+
+    def fire():
+        try:
+            timer.fire()
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            fire_errors.append(exc)
+
+    fire_thread = threading.Thread(target=fire)
+    fire_thread.start()
+    try:
+        assert timer.callback_started.wait(timeout=1)
+        organizer.stop_service()
+    finally:
+        CourseOrganizer._thread_lock.release()
+    fire_thread.join(timeout=2)
+
+    assert fire_errors == []
+    assert not fire_thread.is_alive()
+    assert not any("CourseOrganizer[event=scan_completed]" in message for message in logger.infos)
+    assert {path.name: _filesystem_fingerprint(path) for path in roots} == before
+
+
+def test_run_once_stale_callback_token_cannot_run_new_generation(tmp_path, monkeypatch):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_config, first_roots = _preview_run_once_case(first_root)
+    second_config, second_roots = _preview_run_once_case(second_root)
+    second_before = {path.name: _filesystem_fingerprint(path) for path in second_roots}
+    first = CourseOrganizer(config=dict(first_config))
+    second = CourseOrganizer(config=dict(second_config))
+    first_logger = _RunLogger()
+    second_logger = _RunLogger()
+    monkeypatch.setattr(first, "_logger", first_logger)
+    monkeypatch.setattr(second, "_logger", second_logger)
+    _seed_stable_course(second, second_root / "incoming")
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+
+    first.init_plugin(dict(first_config))
+    timer_a = _RunOnceFakeTimer.created[0]
+    assert CourseOrganizer._thread_lock.acquire(timeout=1)
+    fire_thread = threading.Thread(target=timer_a.fire)
+    fire_thread.start()
+    try:
+        assert timer_a.callback_started.wait(timeout=1)
+        first.stop_service()
+        second.init_plugin(dict(second_config))
+        assert len(_RunOnceFakeTimer.created) == 2
+        timer_b = _RunOnceFakeTimer.created[1]
+    finally:
+        CourseOrganizer._thread_lock.release()
+    fire_thread.join(timeout=2)
+
+    assert not fire_thread.is_alive()
+    assert not any("CourseOrganizer[event=scan_completed]" in message for message in first_logger.infos)
+    assert timer_b.fire() is True
+    assert sum("CourseOrganizer[event=scan_completed]" in message for message in second_logger.infos) == 1
+    assert {path.name: _filesystem_fingerprint(path) for path in second_roots} == second_before
+
+
+def test_run_once_timer_constructor_failure_keeps_retry_flag(tmp_path, monkeypatch):
+    root = tmp_path / "case"
+    root.mkdir()
+    config, _ = _preview_run_once_case(root)
+    organizer = CourseOrganizer(config=dict(config))
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    class FailingTimer:
+        def __init__(self, interval, callback):  # noqa: ARG002
+            raise RuntimeError("constructor failed")
+
+    monkeypatch.setattr(MODULE.threading, "Timer", FailingTimer)
+    organizer.init_plugin(dict(config))
+
+    assert type(organizer)._run_once_timer is None
+    assert type(organizer)._run_once_token is None
+    assert organizer._get_config()["run_once"] is True
+    assert any(
+        "CourseOrganizer[event=run_once_schedule_failed] phase=construct error=RuntimeError" in message
+        for message in logger.errors
+    )
+
+
+def test_run_once_timer_start_failure_keeps_retry_flag(tmp_path, monkeypatch):
+    root = tmp_path / "case"
+    root.mkdir()
+    config, _ = _preview_run_once_case(root)
+    organizer = CourseOrganizer(config=dict(config))
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+
+    class FailingTimer(_RunOnceFakeTimer):
+        def start(self):
+            raise RuntimeError("start failed")
+
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", FailingTimer)
+    organizer.init_plugin(dict(config))
+
+    timer = FailingTimer.created[0]
+    assert timer.cancelled is True
+    assert type(organizer)._run_once_timer is None
+    assert type(organizer)._run_once_token is None
+    assert organizer._get_config()["run_once"] is True
+    assert any(
+        "CourseOrganizer[event=run_once_schedule_failed] phase=start error=RuntimeError" in message
+        for message in logger.errors
+    )
+
+
+def test_run_once_persist_and_stop_are_linearized(tmp_path, monkeypatch):
+    root = tmp_path / "case"
+    root.mkdir()
+    config, _ = _preview_run_once_case(root)
+    organizer = CourseOrganizer(config=dict(config))
+    entered = threading.Event()
+    release = threading.Event()
+    original_persist = organizer._persist_config
+    calls = {"count": 0}
+
+    def blocking_persist(config_value):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            entered.set()
+            assert release.wait(timeout=2)
+        return original_persist(config_value)
+
+    monkeypatch.setattr(organizer, "_persist_config", blocking_persist)
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+    init_thread = threading.Thread(target=organizer.init_plugin, args=(dict(config),))
+    init_thread.start()
+    assert entered.wait(timeout=1)
+    stop_thread = threading.Thread(target=organizer.stop_service)
+    stop_thread.start()
+    release.set()
+    init_thread.join(timeout=2)
+    stop_thread.join(timeout=2)
+
+    assert not init_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert len(_RunOnceFakeTimer.created) == 1
+    assert _RunOnceFakeTimer.created[0].cancelled is True
+    assert type(organizer)._run_once_token is None
+    assert organizer._get_config()["run_once"] is False
+
+
+def test_run_once_claim_uses_stable_latest_preview_config_snapshot(tmp_path, monkeypatch):
+    root = tmp_path / "case"
+    root.mkdir()
+    config, _ = _preview_run_once_case(root)
+    organizer = CourseOrganizer(config=dict(config))
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+    organizer.init_plugin(dict(config))
+    timer = _RunOnceFakeTimer.created[0]
+    observed = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def run(force=False):  # noqa: ARG001
+        observed.append(organizer._get_config()["naming_mode"])
+        entered.set()
+        assert release.wait(timeout=2)
+        observed.append(organizer._get_config()["naming_mode"])
+
+    monkeypatch.setattr(organizer, "_run", run)
+    fire_thread = threading.Thread(target=timer.fire)
+    fire_thread.start()
+    assert entered.wait(timeout=1)
+    organizer.update_config({**config, "run_once": False, "naming_mode": "apply"})
+    release.set()
+    fire_thread.join(timeout=2)
+
+    assert not fire_thread.is_alive()
+    assert observed == ["preview", "preview"]
+    assert organizer._get_config()["naming_mode"] == "apply"
+
+
+def test_run_once_new_request_during_claimed_run_gets_second_generation_after_failure(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "case"
+    root.mkdir()
+    config, _ = _preview_run_once_case(root)
+    organizer = CourseOrganizer(config=dict(config))
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+    organizer.init_plugin(dict(config))
+    timer_a = _RunOnceFakeTimer.created[0]
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    run_calls = []
+
+    def run(force=False):  # noqa: ARG001
+        run_calls.append(force)
+        if len(run_calls) == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=2)
+            raise RuntimeError("first run failed")
+
+    monkeypatch.setattr(organizer, "_run", run)
+    fire_errors = []
+
+    def fire_first():
+        try:
+            timer_a.fire()
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            fire_errors.append(exc)
+
+    fire_thread = threading.Thread(target=fire_first)
+    fire_thread.start()
+    assert first_entered.wait(timeout=1)
+
+    organizer.init_plugin(dict(config))
+    assert len(_RunOnceFakeTimer.created) == 2
+    timer_b = _RunOnceFakeTimer.created[1]
+    assert type(organizer)._run_once_token is not None
+    release_first.set()
+    fire_thread.join(timeout=2)
+
+    assert not fire_thread.is_alive()
+    assert len(fire_errors) == 1
+    assert isinstance(fire_errors[0], RuntimeError)
+    assert timer_b.fire() is True
+    assert run_calls == [True, True]
+    assert type(organizer)._run_once_token is None
+    assert organizer._get_config()["run_once"] is False
+
+
+def test_run_once_claim_persist_failure_does_not_run(tmp_path, monkeypatch):
+    root = tmp_path / "case"
+    root.mkdir()
+    config, roots = _preview_run_once_case(root)
+    before = {path.name: _filesystem_fingerprint(path) for path in roots}
+    organizer = CourseOrganizer(config=dict(config))
+    logger = _RunLogger()
+    monkeypatch.setattr(organizer, "_logger", logger)
+    original_persist = organizer._persist_config
+    calls = {"count": 0}
+
+    def fail_claim(config_value):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return original_persist(config_value)
+        return False
+
+    monkeypatch.setattr(organizer, "_persist_config", fail_claim)
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+    organizer.init_plugin(dict(config))
+    timer = _RunOnceFakeTimer.created[0]
+
+    assert timer.fire() is True
+    assert not any("CourseOrganizer[event=scan_completed]" in message for message in logger.infos)
+    assert any(
+        "CourseOrganizer[event=run_once_persist_failed] phase=claim" in message
+        for message in logger.errors
+    )
+    assert type(organizer)._run_once_token is None
+    assert organizer._get_config()["run_once"] is True
+    assert {path.name: _filesystem_fingerprint(path) for path in roots} == before
+
+
+def test_run_once_coalesce_persist_failure_preserves_original_pending_request(tmp_path, monkeypatch):
+    root = tmp_path / "case"
+    root.mkdir()
+    config, roots = _preview_run_once_case(root)
+    before = {path.name: _filesystem_fingerprint(path) for path in roots}
+    first = CourseOrganizer(config=dict(config))
+    second = CourseOrganizer(config=dict(config))
+    first_logger = _RunLogger()
+    second_logger = _RunLogger()
+    monkeypatch.setattr(first, "_logger", first_logger)
+    monkeypatch.setattr(second, "_logger", second_logger)
+    monkeypatch.setattr(second, "_persist_config", lambda config_value: False)
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+
+    first.init_plugin(dict(config))
+    timer = _RunOnceFakeTimer.created[0]
+    original_owner = type(first)._run_once_owner
+    second.init_plugin(dict(config))
+
+    assert timer.cancelled is False
+    assert type(first)._run_once_owner is original_owner is first
+    assert any(
+        "CourseOrganizer[event=run_once_persist_failed] phase=pending" in message
+        for message in second_logger.errors
+    )
+    assert timer.fire() is True
+    assert sum("CourseOrganizer[event=scan_completed]" in message for message in first_logger.infos) == 1
+    assert {path.name: _filesystem_fingerprint(path) for path in roots} == before
+
+
+def test_run_once_false_reload_persist_failure_preserves_original_pending_request(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "case"
+    root.mkdir()
+    config, roots = _preview_run_once_case(root)
+    before = {path.name: _filesystem_fingerprint(path) for path in roots}
+    first = CourseOrganizer(config=dict(config))
+    second = CourseOrganizer(config={**config, "run_once": False})
+    first_logger = _RunLogger()
+    second_logger = _RunLogger()
+    monkeypatch.setattr(first, "_logger", first_logger)
+    monkeypatch.setattr(second, "_logger", second_logger)
+    monkeypatch.setattr(second, "_persist_config", lambda config_value: False)
+    _RunOnceFakeTimer.created.clear()
+    monkeypatch.setattr(MODULE.threading, "Timer", _RunOnceFakeTimer)
+
+    first.init_plugin(dict(config))
+    timer = _RunOnceFakeTimer.created[0]
+    original_token = type(first)._run_once_token
+    original_owner = type(first)._run_once_owner
+    second.init_plugin({**config, "run_once": False})
+
+    assert timer.cancelled is False
+    assert type(first)._run_once_token == original_token
+    assert type(first)._run_once_owner is original_owner is first
+    assert any(
+        "CourseOrganizer[event=run_once_persist_failed] phase=pending" in message
+        for message in second_logger.errors
+    )
+    assert timer.fire() is True
+    assert sum("CourseOrganizer[event=scan_completed]" in message for message in first_logger.infos) == 1
+    assert {path.name: _filesystem_fingerprint(path) for path in roots} == before
 
 
 def test_stability_defer_branches_emit_structured_item_events_without_paths(tmp_path, monkeypatch):
