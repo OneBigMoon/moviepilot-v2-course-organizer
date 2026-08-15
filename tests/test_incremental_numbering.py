@@ -17,7 +17,7 @@ def test_plugin_version_matches_package_metadata():
     package_path = Path(__file__).parents[1] / "package.v2.json"
     package = json.loads(package_path.read_text(encoding="utf-8"))
 
-    assert CourseOrganizer.plugin_version == "1.5.3"
+    assert CourseOrganizer.plugin_version == "1.5.4"
     assert package["CourseOrganizer"]["version"] == CourseOrganizer.plugin_version
 
 
@@ -872,7 +872,7 @@ def test_run_once_preview_lifecycle_is_fail_closed_and_resets(tmp_path, monkeypa
 
     scan_started = [
         message
-        for message in logger.debugs
+        for message in logger.infos
         if "CourseOrganizer[event=scan_started]" in message
     ]
     assert scan_started == [
@@ -2352,7 +2352,7 @@ def test_run_logs_scan_started_and_scan_completed_with_counts_and_no_path_leakag
     organizer._run(force=True)
 
     scan_started = [
-        msg for msg in logger.debugs if "CourseOrganizer[event=scan_started]" in msg
+        msg for msg in logger.infos if "CourseOrganizer[event=scan_started]" in msg
     ]
     assert len(scan_started) == 2
     assert any("trigger=scheduled" in msg and "mode=apply" in msg for msg in scan_started)

@@ -102,7 +102,7 @@ class CourseOrganizer(_PluginBase):
     plugin_config_prefix = "courseorganizer_"
     auth_level = 1
     plugin_order = 90
-    plugin_version = "1.5.3"
+    plugin_version = "1.5.4"
     plugin_desc = "稳定后识别、分类并整理到电视剧、电影或儿童媒体库"
     plugin_author = "OpenAI"
     plugin_icon = "icons/courseorganizer.svg"
@@ -881,7 +881,7 @@ class CourseOrganizer(_PluginBase):
 
         trigger = "manual" if force else "scheduled"
         mode = str(config.get("naming_mode") or "off")
-        self._logger.debug(
+        self._logger.info(
             "CourseOrganizer[event=scan_started] trigger=%s mode=%s",
             trigger,
             mode,
