@@ -314,7 +314,18 @@ function hasLibrary(row) {
 }
 
 function canConfirm(row) {
-  return hasLibrary(row) && !row.association_required
+  return !row.source_pending && hasLibrary(row) && !row.association_required
+}
+
+function isSourcePending(row) {
+  return Boolean(row.source_pending)
+}
+
+function statusChipColor(row) {
+  if (isSourcePending(row)) return 'info'
+  if (row.status_label === '可以整理') return 'success'
+  if (row.status_label === '已跳过') return 'default'
+  return 'warning'
 }
 
 function targetPath(row) {
@@ -457,7 +468,7 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
                 variant="tonal"
                 min-width="132"
                 :loading="isTmdbLoading(row)"
-                :disabled="isSaving(row) || isTmdbLoading(row) || isOrganizing(row)"
+                :disabled="isSourcePending(row) || isSaving(row) || isTmdbLoading(row) || isOrganizing(row)"
                 :aria-label="`按名称搜索 TMDB：${row.raw_title}`"
                 @click="searchTmdb(row)"
               >
@@ -465,7 +476,17 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
               </VBtn>
               <div class="text-caption text-medium-emphasis mt-1">按当前目录名称搜索，无需输入 TMDB ID</div>
               <VAlert
-                v-if="row.association_required"
+                v-if="isSourcePending(row)"
+                type="info"
+                density="compact"
+                variant="tonal"
+                class="mt-2"
+                role="status"
+              >
+                源目录暂不稳定，无法执行搜索、关联或整理，请稍后点击刷新重试
+              </VAlert>
+              <VAlert
+                v-else-if="row.association_required"
                 type="warning"
                 density="compact"
                 variant="tonal"
@@ -525,7 +546,7 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
                 v-else
                 size="small"
                 variant="tonal"
-                :color="row.status_label === '可以整理' ? 'success' : row.status_label === '已跳过' ? 'default' : 'warning'"
+                :color="statusChipColor(row)"
                 :aria-label="`状态：${row.status_label || '需要确认'}`"
               >
                 {{ row.status_label || '需要确认' }}
@@ -547,7 +568,7 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
                 v-if="row.status_label !== '已跳过'"
                 variant="text"
                 min-width="76"
-                :disabled="isSaving(row) || isOrganizing(row)"
+                :disabled="isSourcePending(row) || isSaving(row) || isOrganizing(row)"
                 :aria-label="`跳过：${row.raw_title}`"
                 @click="saveReview(row, 'ignore')"
               >
@@ -557,7 +578,7 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
                 v-else
                 variant="text"
                 min-width="76"
-                :disabled="Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"
+                :disabled="isSourcePending(row) || Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"
                 :aria-label="`重新确认：${row.raw_title}`"
                 @click="saveReview(row, 'confirm')"
               >
@@ -571,39 +592,39 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
 
     <div v-if="hasItems" class="course-review-cards">
       <VCard v-for="row in items" :key="`card-${row.raw_title}`" border variant="outlined" class="course-review-card">
-        <VCardTitle class="text-subtitle-1 text-break">{{ row.raw_title }}</VCardTitle>
-        <VCardText>
+          <VCardTitle class="text-subtitle-1 text-break">{{ row.raw_title }}</VCardTitle>
+          <VCardText>
           <div class="d-flex align-center ga-2 mb-2">
             <VChip size="small" variant="tonal" color="primary">
-              {{ row.recognition_source_label || '本地' }}
+            {{ row.recognition_source_label || '本地' }}
             </VChip>
             <span class="text-caption text-medium-emphasis">识别来源</span>
           </div>
-              <VTextField
-                v-model="row.final_title"
-                label="建议名称"
-                :aria-label="`建议名称：${row.raw_title}`"
-                variant="outlined"
-                density="comfortable"
-                autocomplete="off"
-                :disabled="isSaving(row) || isOrganizing(row)"
-              />
-              <VProgressLinear
-                v-if="isOrganizing(row)"
-                :indeterminate="!hasOrganizingValue()"
-                :model-value="fileTransferValue || 0"
-                color="primary"
-                class="mb-2"
-                aria-label="正在整理"
-              />
-              <div
-                v-if="isOrganizing(row)"
-                role="status"
-                aria-live="polite"
-                class="text-caption text-medium-emphasis mb-2"
-              >
-                {{ organizingStatusText() }}
-              </div>
+            <VTextField
+            v-model="row.final_title"
+            label="建议名称"
+            :aria-label="`建议名称：${row.raw_title}`"
+            variant="outlined"
+            density="comfortable"
+            autocomplete="off"
+            :disabled="isSaving(row) || isOrganizing(row)"
+            />
+            <VProgressLinear
+            v-if="isOrganizing(row)"
+            :indeterminate="!hasOrganizingValue()"
+            :model-value="fileTransferValue || 0"
+            color="primary"
+            class="mb-2"
+            aria-label="正在整理"
+            />
+            <div
+            v-if="isOrganizing(row)"
+            role="status"
+            aria-live="polite"
+            class="text-caption text-medium-emphasis mb-2"
+            >
+            {{ organizingStatusText() }}
+            </div>
           <VChip
             v-if="isOrganizing(row)"
             size="small"
@@ -614,15 +635,15 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
           >
             整理中
           </VChip>
-              <VBtn
-                class="mb-3"
-                variant="tonal"
-                min-width="132"
-                :loading="isTmdbLoading(row)"
-                :disabled="isSaving(row) || isTmdbLoading(row) || isOrganizing(row)"
-                :aria-label="`按名称搜索 TMDB：${row.raw_title}`"
-                @click="searchTmdb(row)"
-              >
+            <VBtn
+            class="mb-3"
+            variant="tonal"
+            min-width="132"
+            :loading="isTmdbLoading(row)"
+            :disabled="isSourcePending(row) || isSaving(row) || isTmdbLoading(row) || isOrganizing(row)"
+            :aria-label="`按名称搜索 TMDB：${row.raw_title}`"
+            @click="searchTmdb(row)"
+            >
             按名称搜索 TMDB
           </VBtn>
           <div class="text-caption text-medium-emphasis mt-n2 mb-3">按当前目录名称搜索，无需输入 TMDB ID</div>
@@ -633,17 +654,17 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
             class="course-tmdb-candidates mb-3 pa-2"
           >
             <div class="text-caption text-medium-emphasis mb-1">请选择匹配的 TMDB 作品</div>
-              <VBtn
-                v-for="candidate in tmdbCandidatesFor(row)"
-                :key="candidate.candidate_key"
-                block
-                class="course-tmdb-candidate mb-1"
-                variant="text"
-                :disabled="isSaving(row) || isTmdbLoading(row) || isOrganizing(row)"
-                @click="associateTmdb(row, candidate)"
-              >
-              {{ candidate.title }}<span v-if="candidate.year">（{{ candidate.year }}）</span>
-              · {{ candidate.label || candidate.media_type }}
+            <VBtn
+            v-for="candidate in tmdbCandidatesFor(row)"
+            :key="candidate.candidate_key"
+            block
+            class="course-tmdb-candidate mb-1"
+            variant="text"
+            :disabled="isSaving(row) || isTmdbLoading(row) || isOrganizing(row)"
+            @click="associateTmdb(row, candidate)"
+            >
+            {{ candidate.title }}<span v-if="candidate.year">（{{ candidate.year }}）</span>
+            · {{ candidate.label || candidate.media_type }}
             </VBtn>
           </VSheet>
           <VSelect
@@ -651,51 +672,64 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
             :items="libraries"
             item-title="title"
             item-value="value"
-                label="目标媒体库"
-                :aria-label="`目标媒体库：${row.raw_title}`"
-                variant="outlined"
-                density="comfortable"
-                :disabled="isSaving(row) || isOrganizing(row)"
-              />
-          <div class="text-body-2 text-medium-emphasis text-break mb-3">
+            label="目标媒体库"
+            :aria-label="`目标媒体库：${row.raw_title}`"
+            variant="outlined"
+            density="comfortable"
+            :disabled="isSaving(row) || isOrganizing(row)"
+            />
+          <VAlert
+            v-if="isSourcePending(row)"
+            type="info"
+            density="compact"
+            variant="tonal"
+            class="mb-2"
+            role="status"
+          >
+            源目录暂不稳定，无法执行搜索、关联或整理，请稍后点击刷新重试
+          </VAlert>
+          <div class="text-body-2 text-medium-emphasis text-break mb-3" :title="targetPath(row)">
             目标位置：{{ targetPath(row) }}
           </div>
           <div class="d-flex flex-wrap align-center ga-2">
             <VChip size="small" variant="tonal">{{ libraryLabel(row) }}</VChip>
+            <VChip size="small" variant="tonal" :color="statusChipColor(row)">
+            {{ row.status_label || '需要确认' }}
+            </VChip>
             <VSpacer />
             <VBtn
-                color="primary"
-                variant="tonal"
-                min-width="108"
-                :loading="isOrganizing(row)"
-                :disabled="Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"
-                :aria-label="`确认整理：${row.raw_title}`"
-                @click="saveReview(row, 'confirm')"
-              >
-                保存并整理
-              </VBtn>
-              <VBtn
-                v-if="row.status_label !== '已跳过'"
-                variant="text"
-                min-width="76"
-                :disabled="isSaving(row) || isOrganizing(row)"
-                :aria-label="`跳过：${row.raw_title}`"
-                @click="saveReview(row, 'ignore')"
-              >
-                跳过
-              </VBtn>
+            color="primary"
+            variant="tonal"
+            min-width="108"
+            :loading="isOrganizing(row)"
+            :disabled="Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"
+            :aria-label="`确认整理：${row.raw_title}`"
+            @click="saveReview(row, 'confirm')"
+            >
+            保存并整理
+            </VBtn>
             <VBtn
-                v-else
-                variant="text"
-                min-width="76"
-                :disabled="Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"
-                :aria-label="`重新确认：${row.raw_title}`"
-                @click="saveReview(row, 'confirm')"
-              >
-                重新确认
+            v-if="row.status_label !== '已跳过'"
+            variant="text"
+            min-width="76"
+            :disabled="isSourcePending(row) || isSaving(row) || isOrganizing(row)"
+            :aria-label="`跳过：${row.raw_title}`"
+            @click="saveReview(row, 'ignore')"
+            >
+            跳过
+            </VBtn>
+            <VBtn
+            v-else
+            variant="text"
+            min-width="76"
+            :disabled="isSourcePending(row) || Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"
+            :aria-label="`重新确认：${row.raw_title}`"
+            @click="saveReview(row, 'confirm')"
+            >
+            重新确认
             </VBtn>
           </div>
-        </VCardText>
+          </VCardText>
       </VCard>
     </div>
   </section>

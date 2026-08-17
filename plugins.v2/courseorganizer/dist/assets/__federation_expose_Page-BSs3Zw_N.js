@@ -35,7 +35,7 @@ const _hoisted_14 = {
   class: "text-caption text-medium-emphasis mb-2"
 };
 const _hoisted_15 = { key: 0 };
-const _hoisted_16 = { class: "text-body-2 text-medium-emphasis text-break mb-3" };
+const _hoisted_16 = ["title"];
 const _hoisted_17 = { class: "d-flex flex-wrap align-center ga-2" };
 
 const {computed,onMounted,onUnmounted,ref} = await importShared('vue');
@@ -361,7 +361,18 @@ function hasLibrary(row) {
 }
 
 function canConfirm(row) {
-  return hasLibrary(row) && !row.association_required
+  return !row.source_pending && hasLibrary(row) && !row.association_required
+}
+
+function isSourcePending(row) {
+  return Boolean(row.source_pending)
+}
+
+function statusChipColor(row) {
+  if (isSourcePending(row)) return 'info'
+  if (row.status_label === '可以整理') return 'success'
+  if (row.status_label === '已跳过') return 'default'
+  return 'warning'
 }
 
 function targetPath(row) {
@@ -562,7 +573,7 @@ return (_ctx, _cache) => {
                 density: "comfortable"
               }, {
                 default: _withCtx(() => [
-                  _cache[17] || (_cache[17] = _createElementVNode("thead", null, [
+                  _cache[18] || (_cache[18] = _createElementVNode("thead", null, [
                     _createElementVNode("tr", null, [
                       _createElementVNode("th", { scope: "col" }, "原始名称"),
                       _createElementVNode("th", { scope: "col" }, "建议名称（可改）"),
@@ -623,7 +634,7 @@ return (_ctx, _cache) => {
                             variant: "tonal",
                             "min-width": "132",
                             loading: isTmdbLoading(row),
-                            disabled: isSaving(row) || isTmdbLoading(row) || isOrganizing(row),
+                            disabled: isSourcePending(row) || isSaving(row) || isTmdbLoading(row) || isOrganizing(row),
                             "aria-label": `按名称搜索 TMDB：${row.raw_title}`,
                             onClick: $event => (searchTmdb(row))
                           }, {
@@ -632,30 +643,44 @@ return (_ctx, _cache) => {
                             ]))]),
                             _: 1
                           }, 8, ["loading", "disabled", "aria-label", "onClick"]),
-                          _cache[12] || (_cache[12] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mt-1" }, "按当前目录名称搜索，无需输入 TMDB ID", -1)),
-                          (row.association_required)
+                          _cache[13] || (_cache[13] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mt-1" }, "按当前目录名称搜索，无需输入 TMDB ID", -1)),
+                          (isSourcePending(row))
                             ? (_openBlock(), _createBlock(_component_VAlert, {
                                 key: 2,
-                                type: "warning",
+                                type: "info",
                                 density: "compact",
                                 variant: "tonal",
-                                class: "mt-2"
+                                class: "mt-2",
+                                role: "status"
                               }, {
                                 default: _withCtx(() => [...(_cache[10] || (_cache[10] = [
-                                  _createTextVNode(" 整理前需先关联可靠媒体信息 ", -1)
+                                  _createTextVNode(" 源目录暂不稳定，无法执行搜索、关联或整理，请稍后点击刷新重试 ", -1)
                                 ]))]),
                                 _: 1
                               }))
-                            : _createCommentVNode("", true),
+                            : (row.association_required)
+                              ? (_openBlock(), _createBlock(_component_VAlert, {
+                                  key: 3,
+                                  type: "warning",
+                                  density: "compact",
+                                  variant: "tonal",
+                                  class: "mt-2"
+                                }, {
+                                  default: _withCtx(() => [...(_cache[11] || (_cache[11] = [
+                                    _createTextVNode(" 整理前需先关联可靠媒体信息 ", -1)
+                                  ]))]),
+                                  _: 1
+                                }))
+                              : _createCommentVNode("", true),
                           (tmdbCandidatesFor(row).length)
                             ? (_openBlock(), _createBlock(_component_VSheet, {
-                                key: 3,
+                                key: 4,
                                 border: "",
                                 rounded: "",
                                 class: "course-tmdb-candidates mt-2 pa-2"
                               }, {
                                 default: _withCtx(() => [
-                                  _cache[11] || (_cache[11] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mb-1" }, "请选择匹配的 TMDB 作品", -1)),
+                                  _cache[12] || (_cache[12] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mb-1" }, "请选择匹配的 TMDB 作品", -1)),
                                   (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(tmdbCandidatesFor(row), (candidate) => {
                                     return (_openBlock(), _createBlock(_component_VBtn, {
                                       key: candidate.candidate_key,
@@ -708,7 +733,7 @@ return (_ctx, _cache) => {
                                 "aria-label": "整理中",
                                 class: "course-review-organizing-chip"
                               }, {
-                                default: _withCtx(() => [...(_cache[13] || (_cache[13] = [
+                                default: _withCtx(() => [...(_cache[14] || (_cache[14] = [
                                   _createTextVNode(" 整理中 ", -1)
                                 ]))]),
                                 _: 1
@@ -717,7 +742,7 @@ return (_ctx, _cache) => {
                                 key: 1,
                                 size: "small",
                                 variant: "tonal",
-                                color: row.status_label === '可以整理' ? 'success' : row.status_label === '已跳过' ? 'default' : 'warning',
+                                color: statusChipColor(row),
                                 "aria-label": `状态：${row.status_label || '需要确认'}`
                               }, {
                                 default: _withCtx(() => [
@@ -736,7 +761,7 @@ return (_ctx, _cache) => {
                             "aria-label": `确认整理：${row.raw_title}`,
                             onClick: $event => (saveReview(row, 'confirm'))
                           }, {
-                            default: _withCtx(() => [...(_cache[14] || (_cache[14] = [
+                            default: _withCtx(() => [...(_cache[15] || (_cache[15] = [
                               _createTextVNode(" 保存并整理 ", -1)
                             ]))]),
                             _: 1
@@ -746,11 +771,11 @@ return (_ctx, _cache) => {
                                 key: 0,
                                 variant: "text",
                                 "min-width": "76",
-                                disabled: isSaving(row) || isOrganizing(row),
+                                disabled: isSourcePending(row) || isSaving(row) || isOrganizing(row),
                                 "aria-label": `跳过：${row.raw_title}`,
                                 onClick: $event => (saveReview(row, 'ignore'))
                               }, {
-                                default: _withCtx(() => [...(_cache[15] || (_cache[15] = [
+                                default: _withCtx(() => [...(_cache[16] || (_cache[16] = [
                                   _createTextVNode(" 跳过 ", -1)
                                 ]))]),
                                 _: 1
@@ -759,11 +784,11 @@ return (_ctx, _cache) => {
                                 key: 1,
                                 variant: "text",
                                 "min-width": "76",
-                                disabled: Boolean(organizingKey.value) || !canConfirm(row) || isTmdbLoading(row),
+                                disabled: isSourcePending(row) || Boolean(organizingKey.value) || !canConfirm(row) || isTmdbLoading(row),
                                 "aria-label": `重新确认：${row.raw_title}`,
                                 onClick: $event => (saveReview(row, 'confirm'))
                               }, {
-                                default: _withCtx(() => [...(_cache[16] || (_cache[16] = [
+                                default: _withCtx(() => [...(_cache[17] || (_cache[17] = [
                                   _createTextVNode(" 重新确认 ", -1)
                                 ]))]),
                                 _: 1
@@ -807,7 +832,7 @@ return (_ctx, _cache) => {
                         ]),
                         _: 2
                       }, 1024),
-                      _cache[18] || (_cache[18] = _createElementVNode("span", { class: "text-caption text-medium-emphasis" }, "识别来源", -1))
+                      _cache[19] || (_cache[19] = _createElementVNode("span", { class: "text-caption text-medium-emphasis" }, "识别来源", -1))
                     ]),
                     _createVNode(_component_VTextField, {
                       modelValue: row.final_title,
@@ -841,7 +866,7 @@ return (_ctx, _cache) => {
                           class: "mb-2",
                           "aria-label": "整理中"
                         }, {
-                          default: _withCtx(() => [...(_cache[19] || (_cache[19] = [
+                          default: _withCtx(() => [...(_cache[20] || (_cache[20] = [
                             _createTextVNode(" 整理中 ", -1)
                           ]))]),
                           _: 1
@@ -852,16 +877,16 @@ return (_ctx, _cache) => {
                       variant: "tonal",
                       "min-width": "132",
                       loading: isTmdbLoading(row),
-                      disabled: isSaving(row) || isTmdbLoading(row) || isOrganizing(row),
+                      disabled: isSourcePending(row) || isSaving(row) || isTmdbLoading(row) || isOrganizing(row),
                       "aria-label": `按名称搜索 TMDB：${row.raw_title}`,
                       onClick: $event => (searchTmdb(row))
                     }, {
-                      default: _withCtx(() => [...(_cache[20] || (_cache[20] = [
+                      default: _withCtx(() => [...(_cache[21] || (_cache[21] = [
                         _createTextVNode(" 按名称搜索 TMDB ", -1)
                       ]))]),
                       _: 1
                     }, 8, ["loading", "disabled", "aria-label", "onClick"]),
-                    _cache[25] || (_cache[25] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mt-n2 mb-3" }, "按当前目录名称搜索，无需输入 TMDB ID", -1)),
+                    _cache[27] || (_cache[27] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mt-n2 mb-3" }, "按当前目录名称搜索，无需输入 TMDB ID", -1)),
                     (tmdbCandidatesFor(row).length)
                       ? (_openBlock(), _createBlock(_component_VSheet, {
                           key: 3,
@@ -870,7 +895,7 @@ return (_ctx, _cache) => {
                           class: "course-tmdb-candidates mb-3 pa-2"
                         }, {
                           default: _withCtx(() => [
-                            _cache[21] || (_cache[21] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mb-1" }, "请选择匹配的 TMDB 作品", -1)),
+                            _cache[22] || (_cache[22] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mb-1" }, "请选择匹配的 TMDB 作品", -1)),
                             (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(tmdbCandidatesFor(row), (candidate) => {
                               return (_openBlock(), _createBlock(_component_VBtn, {
                                 key: candidate.candidate_key,
@@ -906,7 +931,25 @@ return (_ctx, _cache) => {
                       density: "comfortable",
                       disabled: isSaving(row) || isOrganizing(row)
                     }, null, 8, ["modelValue", "onUpdate:modelValue", "items", "aria-label", "disabled"]),
-                    _createElementVNode("div", _hoisted_16, " 目标位置：" + _toDisplayString(targetPath(row)), 1),
+                    (isSourcePending(row))
+                      ? (_openBlock(), _createBlock(_component_VAlert, {
+                          key: 4,
+                          type: "info",
+                          density: "compact",
+                          variant: "tonal",
+                          class: "mb-2",
+                          role: "status"
+                        }, {
+                          default: _withCtx(() => [...(_cache[23] || (_cache[23] = [
+                            _createTextVNode(" 源目录暂不稳定，无法执行搜索、关联或整理，请稍后点击刷新重试 ", -1)
+                          ]))]),
+                          _: 1
+                        }))
+                      : _createCommentVNode("", true),
+                    _createElementVNode("div", {
+                      class: "text-body-2 text-medium-emphasis text-break mb-3",
+                      title: targetPath(row)
+                    }, " 目标位置：" + _toDisplayString(targetPath(row)), 9, _hoisted_16),
                     _createElementVNode("div", _hoisted_17, [
                       _createVNode(_component_VChip, {
                         size: "small",
@@ -917,6 +960,16 @@ return (_ctx, _cache) => {
                         ]),
                         _: 2
                       }, 1024),
+                      _createVNode(_component_VChip, {
+                        size: "small",
+                        variant: "tonal",
+                        color: statusChipColor(row)
+                      }, {
+                        default: _withCtx(() => [
+                          _createTextVNode(_toDisplayString(row.status_label || '需要确认'), 1)
+                        ]),
+                        _: 2
+                      }, 1032, ["color"]),
                       _createVNode(_component_VSpacer),
                       _createVNode(_component_VBtn, {
                         color: "primary",
@@ -927,7 +980,7 @@ return (_ctx, _cache) => {
                         "aria-label": `确认整理：${row.raw_title}`,
                         onClick: $event => (saveReview(row, 'confirm'))
                       }, {
-                        default: _withCtx(() => [...(_cache[22] || (_cache[22] = [
+                        default: _withCtx(() => [...(_cache[24] || (_cache[24] = [
                           _createTextVNode(" 保存并整理 ", -1)
                         ]))]),
                         _: 1
@@ -937,11 +990,11 @@ return (_ctx, _cache) => {
                             key: 0,
                             variant: "text",
                             "min-width": "76",
-                            disabled: isSaving(row) || isOrganizing(row),
+                            disabled: isSourcePending(row) || isSaving(row) || isOrganizing(row),
                             "aria-label": `跳过：${row.raw_title}`,
                             onClick: $event => (saveReview(row, 'ignore'))
                           }, {
-                            default: _withCtx(() => [...(_cache[23] || (_cache[23] = [
+                            default: _withCtx(() => [...(_cache[25] || (_cache[25] = [
                               _createTextVNode(" 跳过 ", -1)
                             ]))]),
                             _: 1
@@ -950,11 +1003,11 @@ return (_ctx, _cache) => {
                             key: 1,
                             variant: "text",
                             "min-width": "76",
-                            disabled: Boolean(organizingKey.value) || !canConfirm(row) || isTmdbLoading(row),
+                            disabled: isSourcePending(row) || Boolean(organizingKey.value) || !canConfirm(row) || isTmdbLoading(row),
                             "aria-label": `重新确认：${row.raw_title}`,
                             onClick: $event => (saveReview(row, 'confirm'))
                           }, {
-                            default: _withCtx(() => [...(_cache[24] || (_cache[24] = [
+                            default: _withCtx(() => [...(_cache[26] || (_cache[26] = [
                               _createTextVNode(" 重新确认 ", -1)
                             ]))]),
                             _: 1
@@ -974,6 +1027,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Page = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-552c87b4"]]);
+const Page = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-e02dfcb2"]]);
 
 export { Page as default };

@@ -679,12 +679,13 @@ class CourseOrganizer(_PluginBase):
             if storage != "local" or library_storage != "local":
                 issues.append(f"{labels[library]}规则不是本地存储，当前复核台不能处理")
                 continue
+            rule_alias = str(
+                self._directory_rule_value(rule, "name", "") or labels[library]
+            )
             summary = {
-                "title": labels[library],
+                "title": rule_alias,
                 "value": library,
-                "name": str(
-                    self._directory_rule_value(rule, "name", "") or labels[library]
-                ),
+                "name": rule_alias,
                 "download_path": download_path,
                 "path": library_path,
                 "monitor_type": str(
@@ -1673,6 +1674,7 @@ class CourseOrganizer(_PluginBase):
                     "status": str(item.get("status", "")),
                     "status_label": item["status_label"],
                     "association_required": association_required,
+                    "source_pending": bool(item.get("source_pending", False)),
                     "recognition_source_label": self._recognition_source_label(
                         item.get("source", ""),
                         item.get("reason_codes", ()),

@@ -349,7 +349,13 @@ def test_vue_build_filter_preserves_course_component_overrides():
     assert page_source.count('v-if="isOrganizing(row)"') >= 4
     assert page_source.count(':loading="isOrganizing(row)"') >= 2
     assert "hasOrganizingValue()" in page_source
-    assert page_source.count(':disabled="Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"') >= 4
+    assert page_source.count(':disabled="Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"') >= 2
+    assert (
+        page_source.count(
+            ':disabled="isSourcePending(row) || Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"'
+        )
+        >= 2
+    )
     assert "items.value = items.value.filter(item => item.raw_title !== row.raw_title)" in page_source
     assert "notice.value = '整理完成'" in page_source
     assert "文件移动完成，正在写入整理记录…" in page_source
