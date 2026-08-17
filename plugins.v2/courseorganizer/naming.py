@@ -41,9 +41,59 @@ def _ordered_reasons(items: Sequence[str]) -> Tuple[str, ...]:
 PARSER_SCHEMA_VERSION = "1"
 SCORER_SCHEMA_VERSION = "1"
 
+MANUAL_TARGET_LIBRARIES = ("tv", "movie", "children")
+_MANUAL_NAME_INVALID_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f-\x9f]')
+_MANUAL_FORMAT_INVALID_CHARS = frozenset(
+    "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+)
+_MANUAL_NAME_MAX_BYTES = 160
+
+
+def validate_manual_name(value: object) -> Tuple[bool, str]:
+    """Validate a user supplied directory name without silently rewriting it."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value.splitlines()) != 1
+    ):
+        return False, "invalid_manual_name"
+    try:
+        encoded = value.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        return False, "invalid_manual_name"
+    if len(encoded) > _MANUAL_NAME_MAX_BYTES or value in {".", ".."}:
+        return False, "invalid_manual_name"
+    if _MANUAL_NAME_INVALID_RE.search(value) or any(
+        char in _MANUAL_FORMAT_INVALID_CHARS for char in value
+    ):
+        return False, "invalid_manual_name"
+    return True, ""
+
 
 def _normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(value))).strip()
+
+
+def validate_manual_raw_title(value: object) -> Tuple[bool, str]:
+    """Validate an exact preview-row key without normalizing its spelling."""
+    if not isinstance(value, str) or not value or not value.strip() or len(value) > 255:
+        return False, "invalid_raw_title"
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        return False, "invalid_raw_title"
+    if any(char in value for char in ("\x00", "=>")):
+        return False, "invalid_raw_title"
+    if len(value.splitlines()) != 1:
+        return False, "invalid_raw_title"
+    if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
+        return False, "invalid_raw_title"
+    if any(char in value for char in ("\u2028", "\u2029")):
+        return False, "invalid_raw_title"
+    if any(char in _MANUAL_FORMAT_INVALID_CHARS for char in value):
+        return False, "invalid_raw_title"
+    return True, ""
 
 
 def normalize_title(value: str) -> str:
@@ -133,6 +183,16 @@ class ManualOverride:
     raw_title: str
     action: str
     value: str = ""
+    target_library: str = ""
+    source_revision: str = ""
+    target_output_root: str = ""
+    source_path: str = ""
+    source_identity: Tuple[Tuple[str, int], ...] = ()
+    source_snapshot_digest: str = ""
+    source_manifest: Tuple[Tuple[str, int, int, int, int, int], ...] = ()
+    source_manifest_digest: str = ""
+    source_directory_manifest: Tuple[Tuple[str, int, int], ...] = ()
+    source_directory_manifest_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -491,7 +551,11 @@ def parse_manual_overrides(raw_text: str) -> ManualOverrideResult:
             errors.append(f"empty_left:{text}")
             line_errors.append(("", f"empty_left:{text}"))
             continue
-        if action not in {"local", "query", "candidate", "ignore"}:
+        if "=>" in left or "\x00" in left or "\r" in left or "\n" in left:
+            errors.append(f"invalid_rule:{text}")
+            line_errors.append((left, f"invalid_rule:{text}"))
+            continue
+        if action not in {"local", "query", "candidate", "ignore", "confirm"}:
             errors.append(f"invalid_rule:{text}")
             line_errors.append((left, f"invalid_rule:{text}"))
             continue
@@ -506,6 +570,32 @@ def parse_manual_overrides(raw_text: str) -> ManualOverrideResult:
                 line_errors.append((left, f"duplicate_left:{left}"))
                 continue
             seen[left] = ManualOverride(left, "ignore")
+            continue
+
+        if action == "confirm":
+            target, separator, final_name = value.partition(":")
+            target_clean = target.strip().lower()
+            if (
+                not separator
+                or target != target.strip()
+                or target_clean != target
+                or final_name != final_name.strip()
+            ):
+                error = f"invalid_confirm:{text}"
+                errors.append(error)
+                line_errors.append((left, error))
+                continue
+            valid_name, name_error = validate_manual_name(final_name)
+            if target_clean not in MANUAL_TARGET_LIBRARIES or not valid_name:
+                error = f"invalid_confirm:{text}"
+                errors.append(error)
+                line_errors.append((left, error if valid_name else name_error))
+                continue
+            if left in seen:
+                errors.append(f"duplicate_left:{left}")
+                line_errors.append((left, f"duplicate_left:{left}"))
+                continue
+            seen[left] = ManualOverride(left, "confirm", final_name, target_clean)
             continue
 
         if not value:
@@ -829,6 +919,18 @@ def format_root_name(hints: TitleHints, candidate: Optional[MetadataCandidate], 
 
     base = _select_title_by_query(hints, candidate)
     root = base
+    if candidate.year is not None:
+        root += f" ({candidate.year})"
+    if append_tmdb_id and candidate.source == "themoviedb":
+        root += f" [tmdbid-{candidate.media_id}]"
+    return root
+
+
+def format_selected_candidate_name(
+    candidate: MetadataCandidate, append_tmdb_id: bool = False
+) -> str:
+    """Format a manually selected result from the exact displayed provider title."""
+    root = candidate.title or candidate.en_title or candidate.original_title
     if candidate.year is not None:
         root += f" ({candidate.year})"
     if append_tmdb_id and candidate.source == "themoviedb":

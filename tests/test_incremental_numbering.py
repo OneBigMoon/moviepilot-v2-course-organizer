@@ -17,7 +17,7 @@ def test_plugin_version_matches_package_metadata():
     package_path = Path(__file__).parents[1] / "package.v2.json"
     package = json.loads(package_path.read_text(encoding="utf-8"))
 
-    assert CourseOrganizer.plugin_version == "1.5.4"
+    assert CourseOrganizer.plugin_version == "1.5.14"
     assert package["CourseOrganizer"]["version"] == CourseOrganizer.plugin_version
 
 
@@ -1932,6 +1932,405 @@ def test_move_file_without_bound_roots_fails_closed(tmp_path):
     assert not target.parent.exists()
 
 
+def test_rollback_quarantine_preserves_replacement_after_identity_check(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    created_fd = organizer._open_nofollow_dir_chain(
+        context["target_root"]["fd"],
+        "created",
+        create=True,
+        created=context["created_target_dirs"],
+    )
+    os.close(created_fd)
+    original_noreplace = organizer._rename_noreplace
+    raced = {"value": False}
+
+    def noreplace_then_replace(parent_fd, source_name, target_parent_fd, target_name):
+        result = original_noreplace(
+            parent_fd, source_name, target_parent_fd, target_name
+        )
+        if result and source_name == "created" and target_name.startswith(
+            ".courseorganizer-rollback-"
+        ):
+            os.mkdir("created", dir_fd=parent_fd)
+            raced["value"] = True
+        return result
+
+    monkeypatch.setattr(organizer, "_rename_noreplace", noreplace_then_replace)
+    try:
+        organizer._rollback_move_context(context)
+    finally:
+        organizer._close_move_context(context)
+
+    assert raced["value"] is True
+    assert (target_root / "created").is_dir()
+    quarantine_dirs = list(target_root.glob(".courseorganizer-rollback-*"))
+    assert len(quarantine_dirs) == 1
+    assert not list(quarantine_dirs[0].iterdir())
+
+
+def test_rollback_quarantine_restores_late_content_to_original_name(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    created_fd = organizer._open_nofollow_dir_chain(
+        context["target_root"]["fd"],
+        "created",
+        create=True,
+        created=context["created_target_dirs"],
+    )
+    os.close(created_fd)
+    original_noreplace = organizer._rename_noreplace
+    injected = {"value": False}
+
+    def noreplace_then_write(parent_fd, source_name, target_parent_fd, target_name):
+        result = original_noreplace(
+            parent_fd, source_name, target_parent_fd, target_name
+        )
+        if result and source_name == "created" and target_name.startswith(
+            ".courseorganizer-rollback-"
+        ):
+            (target_root / target_name / "late.txt").write_bytes(b"late")
+            injected["value"] = True
+        return result
+
+    monkeypatch.setattr(organizer, "_rename_noreplace", noreplace_then_write)
+    try:
+        organizer._rollback_move_context(context)
+    finally:
+        organizer._close_move_context(context)
+
+    assert injected["value"] is True
+    assert (target_root / "created" / "late.txt").read_bytes() == b"late"
+    assert not list(target_root.glob(".courseorganizer-rollback-*"))
+
+
+def test_rollback_quarantine_restores_write_after_initial_empty_check(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    created_fd = organizer._open_nofollow_dir_chain(
+        context["target_root"]["fd"],
+        "created",
+        create=True,
+        created=context["created_target_dirs"],
+    )
+    os.close(created_fd)
+    original_noreplace = organizer._rename_noreplace
+    original_fsync = organizer._fsync_dir
+    state = {"candidate": None, "written": False}
+
+    def capture_quarantine(parent_fd, source_name, target_parent_fd, target_name):
+        result = original_noreplace(
+            parent_fd, source_name, target_parent_fd, target_name
+        )
+        if result and source_name == "created":
+            state["candidate"] = target_name
+        return result
+
+    def write_after_first_check(directory_fd):
+        original_fsync(directory_fd)
+        candidate = state["candidate"]
+        if candidate is not None and not state["written"]:
+            (target_root / candidate / "late.txt").write_bytes(b"late")
+            state["written"] = True
+
+    monkeypatch.setattr(organizer, "_rename_noreplace", capture_quarantine)
+    monkeypatch.setattr(organizer, "_fsync_dir", write_after_first_check)
+    try:
+        organizer._rollback_move_context(context)
+    finally:
+        organizer._close_move_context(context)
+
+    assert state["written"] is True
+    assert (target_root / "created" / "late.txt").read_bytes() == b"late"
+    assert not list(target_root.glob(".courseorganizer-rollback-*"))
+
+
+def test_rollback_quarantine_keeps_late_content_when_name_is_replaced(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    created_fd = organizer._open_nofollow_dir_chain(
+        context["target_root"]["fd"],
+        "created",
+        create=True,
+        created=context["created_target_dirs"],
+    )
+    os.close(created_fd)
+    original_noreplace = organizer._rename_noreplace
+    injected = {"value": False}
+
+    def noreplace_then_replace_and_write(
+        parent_fd, source_name, target_parent_fd, target_name
+    ):
+        result = original_noreplace(
+            parent_fd, source_name, target_parent_fd, target_name
+        )
+        if result and source_name == "created" and target_name.startswith(
+            ".courseorganizer-rollback-"
+        ):
+            (target_root / "created").mkdir()
+            (target_root / "created" / "replacement.txt").write_bytes(b"replacement")
+            (target_root / target_name / "late.txt").write_bytes(b"late")
+            injected["value"] = True
+        return result
+
+    monkeypatch.setattr(
+        organizer, "_rename_noreplace", noreplace_then_replace_and_write
+    )
+    try:
+        organizer._rollback_move_context(context)
+    finally:
+        organizer._close_move_context(context)
+
+    assert injected["value"] is True
+    assert (target_root / "created" / "replacement.txt").read_bytes() == b"replacement"
+    quarantine_dirs = list(target_root.glob(".courseorganizer-rollback-*"))
+    assert len(quarantine_dirs) == 1
+    assert (quarantine_dirs[0] / "late.txt").read_bytes() == b"late"
+
+
+def test_rollback_quarantine_candidate_replacement_is_not_deleted_or_overwritten(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    created_fd = organizer._open_nofollow_dir_chain(
+        context["target_root"]["fd"],
+        "created",
+        create=True,
+        created=context["created_target_dirs"],
+    )
+    os.close(created_fd)
+    original_noreplace = organizer._rename_noreplace
+    injected = {"value": False}
+
+    def noreplace_then_replace_candidate(
+        parent_fd, source_name, target_parent_fd, target_name
+    ):
+        result = original_noreplace(
+            parent_fd, source_name, target_parent_fd, target_name
+        )
+        if result and source_name == "created" and target_name.startswith(
+            ".courseorganizer-rollback-"
+        ):
+            original_candidate = f"{target_name}.original"
+            os.rename(
+                target_name,
+                original_candidate,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.mkdir(target_name, dir_fd=parent_fd)
+            (target_root / target_name / "replacement.txt").write_bytes(
+                b"replacement"
+            )
+            injected["value"] = True
+        return result
+
+    monkeypatch.setattr(
+        organizer, "_rename_noreplace", noreplace_then_replace_candidate
+    )
+    try:
+        organizer._rollback_move_context(context)
+    finally:
+        organizer._close_move_context(context)
+
+    assert injected["value"] is True
+    candidate_dirs = list(target_root.glob(".courseorganizer-rollback-*"))
+    assert len(candidate_dirs) == 2
+    replacement = next(
+        path for path in candidate_dirs if (path / "replacement.txt").exists()
+    )
+    assert (replacement / "replacement.txt").read_bytes() == b"replacement"
+
+
+def test_rollback_quarantine_does_not_use_name_based_final_rmdir(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    created_fd = organizer._open_nofollow_dir_chain(
+        context["target_root"]["fd"],
+        "created",
+        create=True,
+        created=context["created_target_dirs"],
+    )
+    os.close(created_fd)
+
+    def forbidden_rmdir(*args: object, **kwargs: object) -> None:
+        raise AssertionError("created target cleanup must not use name-based rmdir")
+
+    monkeypatch.setattr(os, "rmdir", forbidden_rmdir)
+    try:
+        organizer._remove_created_target_dirs(context)
+    finally:
+        organizer._close_move_context(context)
+
+    assert not (target_root / "created").exists()
+    assert len(list(target_root.glob(".courseorganizer-rollback-*"))) == 1
+
+
+def test_rollback_quarantine_nested_created_tree_uses_one_outer_root(
+    tmp_path,
+):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    nested_fd = organizer._open_nofollow_dir_chain(
+        context["target_root"]["fd"],
+        "created/child",
+        create=True,
+        created=context["created_target_dirs"],
+    )
+    os.close(nested_fd)
+    leaf_fd = organizer._open_nofollow_dir_chain(
+        context["target_root"]["fd"],
+        "created/child/leaf",
+        create=True,
+        created=context["created_target_dirs"],
+    )
+    os.close(leaf_fd)
+    try:
+        organizer._rollback_move_context(context)
+    finally:
+        organizer._close_move_context(context)
+
+    assert not (target_root / "created").exists()
+    quarantine_dirs = list(target_root.glob(".courseorganizer-rollback-*"))
+    assert len(quarantine_dirs) == 1
+    assert (quarantine_dirs[0] / "child" / "leaf").is_dir()
+    assert not list(quarantine_dirs[0].rglob(".courseorganizer-rollback-*"))
+
+
+@pytest.mark.parametrize(
+    "invalid_entry",
+    [
+        ("/a", (1, 2)),
+        ("a/../a", (1, 2)),
+        ("a/./b", (1, 2)),
+        ("a//b", (1, 2)),
+        ("a/", (1, 2)),
+        ("../a", (1, 2)),
+        ("a\x00b", (1, 2)),
+        ("a\\b", (1, 2)),
+        (None, (1, 2)),
+        (123, (1, 2)),
+        ("other", (True, 2)),
+        ("other", (1,)),
+        ("other", (1, "2")),
+        ("other", [1, 2]),
+        ("other", (-1, 2)),
+        ("other", (1, -1)),
+        (("other", (1, 2), "extra"),),
+        ("valid", (1, 2)),
+    ],
+)
+def test_remove_created_target_dirs_rejects_invalid_ledger_before_io(
+    tmp_path, monkeypatch, invalid_entry
+):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    tracked = target_root / "valid"
+    tracked.mkdir()
+    (tracked / "keep.txt").write_bytes(b"keep")
+    tracked_stat = tracked.stat()
+    valid_entry = ("valid", (int(tracked_stat.st_dev), int(tracked_stat.st_ino)))
+    ledger = [valid_entry, invalid_entry]
+    original_ledger = ledger
+    original_ledger_content = list(ledger)
+    context["created_target_dirs"] = ledger
+    io_calls = {"open": 0, "lstat": 0, "rename": 0}
+
+    def snapshot(path):
+        entries = [path, *sorted(path.rglob("*"))]
+        result = []
+        for entry in entries:
+            info = entry.lstat()
+            content = entry.read_bytes() if stat.S_ISREG(info.st_mode) else None
+            result.append(
+                (
+                    str(entry.relative_to(target_root)),
+                    int(info.st_dev),
+                    int(info.st_ino),
+                    int(info.st_mode),
+                    int(info.st_size),
+                    content,
+                )
+            )
+        return tuple(result)
+
+    before = snapshot(target_root)
+
+    original_open = os.open
+    original_stat = os.stat
+
+    def count_open(*args, **kwargs):
+        io_calls["open"] += 1
+        return original_open(*args, **kwargs)
+
+    def count_lstat(*args, **kwargs):
+        io_calls["lstat"] += 1
+        return original_stat(*args, **kwargs)
+
+    def count_rename(*args, **kwargs):
+        io_calls["rename"] += 1
+        return False
+
+    monkeypatch.setattr(os, "open", count_open)
+    monkeypatch.setattr(os, "stat", count_lstat)
+    monkeypatch.setattr(organizer, "_rename_noreplace", count_rename)
+    try:
+        organizer._remove_created_target_dirs(context)
+    finally:
+        organizer._close_move_context(context)
+
+    assert io_calls == {"open": 0, "lstat": 0, "rename": 0}
+    assert context["created_target_dirs"] is original_ledger
+    assert context["created_target_dirs"] == original_ledger_content
+    assert snapshot(target_root) == before
+    assert not list(target_root.glob(".courseorganizer-rollback-*"))
+
+
 def test_move_file_exdev_copy_preserves_metadata_and_cleans_publish_error(tmp_path, monkeypatch):
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
@@ -2027,11 +2426,269 @@ def test_move_file_source_replacement_at_stage_boundary_is_restored_without_succ
     ) is False
     assert swapped["value"] is True
     assert backup.read_bytes() == b"safe-source"
-    assert source.is_symlink()
+    assert source.read_bytes() == b"safe-source"
+    stage_dirs = list(source_root.glob(".courseorganizer-stage*"))
+    assert len(stage_dirs) == 1
+    staged_replacement = stage_dirs[0] / "00000001-lesson.mp4"
+    assert staged_replacement.is_symlink()
+    assert staged_replacement.resolve() == external
     assert external.read_bytes() == b"external-bytes"
     assert not os.path.lexists(target)
-    assert not list(source_root.glob(".courseorganizer-stage*"))
     assert not list(target_root.rglob("*.tmp.*"))
+
+
+def test_stage_source_open_emfile_fails_closed_before_rename(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = source_root / "lesson.mp4"
+    source.write_bytes(b"safe-source")
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    captured = organizer._capture_move_identity(context, str(source))
+    assert captured is not None
+    original_open = os.open
+    failed = {"value": False}
+
+    def fail_source_open(path, *args, **kwargs):
+        if path == "lesson.mp4" and kwargs.get("dir_fd") is not None:
+            failed["value"] = True
+            raise OSError(errno.EMFILE, "source fd limit")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fail_source_open)
+    try:
+        assert organizer._stage_move_source(context, str(source), captured) is None
+        assert failed["value"] is True
+        assert source.read_bytes() == b"safe-source"
+        stage_dirs = list(source_root.glob(".courseorganizer-stage*"))
+        assert len(stage_dirs) == 1
+        assert list(stage_dirs[0].iterdir()) == []
+    finally:
+        organizer._rollback_move_context(context)
+        organizer._close_move_context(context)
+
+
+def test_stage_source_fstat_emfile_closes_held_fd_before_rename(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = source_root / "lesson.mp4"
+    source.write_bytes(b"safe-source")
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    captured = organizer._capture_move_identity(context, str(source))
+    assert captured is not None
+    original_open = os.open
+    original_fstat = os.fstat
+    original_close = os.close
+    state = {"fd": None, "failed": False, "closed": False}
+
+    def track_source_open(path, *args, **kwargs):
+        fd = original_open(path, *args, **kwargs)
+        if path == "lesson.mp4" and kwargs.get("dir_fd") is not None:
+            state["fd"] = fd
+        return fd
+
+    def fail_source_fstat(fd):
+        if fd == state["fd"] and not state["failed"]:
+            state["failed"] = True
+            raise OSError(errno.EMFILE, "source stat limit")
+        return original_fstat(fd)
+
+    def track_close(fd):
+        if fd == state["fd"]:
+            state["closed"] = True
+        return original_close(fd)
+
+    monkeypatch.setattr(os, "open", track_source_open)
+    monkeypatch.setattr(os, "fstat", fail_source_fstat)
+    monkeypatch.setattr(os, "close", track_close)
+    try:
+        assert organizer._stage_move_source(context, str(source), captured) is None
+        assert state == {"fd": state["fd"], "failed": True, "closed": True}
+        assert source.read_bytes() == b"safe-source"
+        stage_dirs = list(source_root.glob(".courseorganizer-stage*"))
+        assert len(stage_dirs) == 1
+        assert list(stage_dirs[0].iterdir()) == []
+    finally:
+        organizer._rollback_move_context(context)
+        organizer._close_move_context(context)
+
+
+def test_stage_original_fd_is_held_until_context_close(tmp_path):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = source_root / "lesson.mp4"
+    source.write_bytes(b"safe-source")
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    captured = organizer._capture_move_identity(context, str(source))
+    assert captured is not None
+    item = organizer._stage_move_source(context, str(source), captured)
+    assert item is not None
+    original_fd = item["original_fd"]
+    assert os.fstat(original_fd).st_ino == item["identity"][1]
+    organizer._rollback_move_context(context)
+    organizer._close_move_context(context)
+    with pytest.raises(OSError):
+        os.fstat(original_fd)
+
+
+def test_stage_path_replacement_after_rename_restores_original_and_keeps_replacement(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    external_root = tmp_path / "external"
+    source_root.mkdir()
+    target_root.mkdir()
+    external_root.mkdir()
+    source = source_root / "lesson.mp4"
+    external = external_root / "outside.mp4"
+    target = target_root / "lesson.mp4"
+    source.write_bytes(b"safe-source")
+    external.write_bytes(b"replacement")
+    original_rename = os.rename
+    swapped = {"value": False}
+
+    def replace_stage_after_rename(src: str, dst: str, **kwargs: object) -> None:
+        original_rename(src, dst, **kwargs)
+        if not swapped["value"] and kwargs.get("dst_dir_fd") is not None:
+            os.unlink(dst, dir_fd=kwargs["dst_dir_fd"])
+            os.symlink(str(external), dst, dir_fd=kwargs["dst_dir_fd"])
+            swapped["value"] = True
+
+    monkeypatch.setattr(os, "rename", replace_stage_after_rename)
+    organizer = _organizer()
+    assert organizer._move_file(
+        str(source), str(target), source_root=str(source_root), target_root=str(target_root)
+    ) is False
+    assert swapped["value"] is True
+    assert source.read_bytes() == b"safe-source"
+    stage_dirs = list(source_root.glob(".courseorganizer-stage*"))
+    assert len(stage_dirs) == 1
+    staged_replacement = stage_dirs[0] / "00000001-lesson.mp4"
+    assert staged_replacement.is_symlink()
+    assert staged_replacement.resolve() == external
+    assert not os.path.lexists(target)
+
+
+def test_stage_path_inode_replacement_prefers_held_original_link(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    external_root = tmp_path / "external"
+    source_root.mkdir()
+    target_root.mkdir()
+    external_root.mkdir()
+    source = source_root / "lesson.mp4"
+    external = external_root / "outside.mp4"
+    target = target_root / "lesson.mp4"
+    source.write_bytes(b"safe-source")
+    external.write_bytes(b"replacement")
+    original_inode = source.stat().st_ino
+    original_rename = os.rename
+    swapped = {"value": False}
+
+    def replace_stage_with_held_original(
+        src: str, dst: str, **kwargs: object
+    ) -> None:
+        original_rename(src, dst, **kwargs)
+        if not swapped["value"] and kwargs.get("dst_dir_fd") is not None:
+            stage_fd = kwargs["dst_dir_fd"]
+            held_name = "held-original"
+            original_rename(
+                dst,
+                held_name,
+                src_dir_fd=stage_fd,
+                dst_dir_fd=stage_fd,
+            )
+            os.symlink(str(external), dst, dir_fd=stage_fd)
+            swapped["value"] = True
+
+    monkeypatch.setattr(os, "rename", replace_stage_with_held_original)
+    organizer = _organizer()
+
+    assert organizer._move_file(
+        str(source), str(target), source_root=str(source_root), target_root=str(target_root)
+    ) is False
+    assert swapped["value"] is True
+    assert source.read_bytes() == b"safe-source"
+    assert source.stat().st_ino == original_inode
+    assert not os.path.lexists(target)
+    stage_dirs = list(source_root.glob(".courseorganizer-stage*"))
+    assert len(stage_dirs) == 1
+    stage_entries = list(stage_dirs[0].iterdir())
+    assert [entry.name for entry in stage_entries] == ["00000001-lesson.mp4"]
+    assert stage_entries[0].is_symlink()
+    assert stage_entries[0].resolve() == external
+    assert not any(
+        not entry.is_symlink() and entry.stat().st_ino == original_inode
+        for entry in stage_entries
+    )
+
+
+def test_stage_path_inode_replacement_closes_bound_fds_after_restore(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    external_root = tmp_path / "external"
+    source_root.mkdir()
+    target_root.mkdir()
+    external_root.mkdir()
+    source = source_root / "lesson.mp4"
+    external = external_root / "outside.mp4"
+    source.write_bytes(b"safe-source")
+    external.write_bytes(b"replacement")
+    original_rename = os.rename
+    swapped = {"value": False}
+
+    def replace_stage_with_held_original(
+        src: str, dst: str, **kwargs: object
+    ) -> None:
+        original_rename(src, dst, **kwargs)
+        if not swapped["value"] and kwargs.get("dst_dir_fd") is not None:
+            stage_fd = kwargs["dst_dir_fd"]
+            original_rename(
+                dst,
+                "held-original",
+                src_dir_fd=stage_fd,
+                dst_dir_fd=stage_fd,
+            )
+            os.symlink(str(external), dst, dir_fd=stage_fd)
+            swapped["value"] = True
+
+    monkeypatch.setattr(os, "rename", replace_stage_with_held_original)
+    organizer = _organizer()
+    context = organizer._create_move_context(str(source_root), str(target_root))
+    assert context is not None
+    captured = organizer._capture_move_identity(context, str(source))
+    assert captured is not None
+    bound_fds = [
+        context["stage_fd"],
+        context["source_root"]["fd"],
+        context["target_root"]["fd"],
+    ]
+    item = organizer._stage_move_source(context, str(source), captured)
+    assert item is None
+    assert swapped["value"] is True
+    assert source.read_bytes() == b"safe-source"
+    assert not list(target_root.iterdir())
+    organizer._rollback_move_context(context)
+    organizer._close_move_context(context)
+    for fd in bound_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
 
 
 def test_process_course_rejects_bound_real_directory_root_replacement(tmp_path, monkeypatch):

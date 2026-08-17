@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import json
 import os
@@ -207,6 +208,7 @@ class NamingDecision:
     blocked_reason: str = ""
     legacy_output_root: str = ""
     target_output_root: str = ""
+    target_library: str = ""
 
     @property
     def allowed_to_move(self) -> bool:
@@ -284,6 +286,7 @@ class SmartNamingResolver:
         config: NamingConfig,
         legacy_output_root: str = "",
         target_output_root: str = "",
+        manual_decision: Optional[naming.ManualOverride] = None,
     ) -> NamingDecision:
         now = int(self._clock())
         config = NamingConfig.sanitize(config)
@@ -302,10 +305,10 @@ class SmartNamingResolver:
         )
 
         overrides = naming.parse_manual_overrides(config.manual_overrides)
-        override_diagnostics = tuple(
+        override_diagnostics = () if manual_decision is not None else tuple(
             code for left, code in overrides.line_errors if not left
         )
-        raw_override_errors = tuple(
+        raw_override_errors = () if manual_decision is not None else tuple(
             code
             for code_left, code in overrides.line_errors
             if code_left == raw_title
@@ -324,16 +327,29 @@ class SmartNamingResolver:
                 target_output_root=target_output_root,
             )
 
-        matched_override = None
-        for item in overrides.overrides:
-            if item.raw_title == raw_title:
-                matched_override = item
-                break
+        matched_override = manual_decision
+        if matched_override is None:
+            for item in overrides.overrides:
+                if item.raw_title == raw_title:
+                    matched_override = item
+                    break
         has_matching_local_override = (
             matched_override is not None and matched_override.action == "local"
         )
 
         if matched_override is not None:
+            if matched_override.action == "invalid":
+                return self.record_decision(
+                    self._decision(
+                        status="invalid_manual_decision",
+                        raw_title=raw_title,
+                        hints=hints,
+                        reason_codes=("invalid_manual_decision",),
+                        blocked_reason="invalid_manual_decision",
+                    ),
+                    legacy_output_root=legacy_output_root,
+                    target_output_root=target_output_root,
+                )
             if matched_override.action == "ignore":
                 return self.record_decision(
                     self._decision(
@@ -345,6 +361,36 @@ class SmartNamingResolver:
                     ),
                     legacy_output_root=legacy_output_root,
                     target_output_root=target_output_root,
+                )
+
+            if matched_override.action == "confirm":
+                # Manual confirmation is deliberately a local fallback: it
+                # bypasses metadata and uses the exact, validated final name.
+                decision = self._decision(
+                    status="local_fallback",
+                    raw_title=raw_title,
+                    hints=naming.TitleHints(
+                        raw_title=hints.raw_title,
+                        local_title=matched_override.value,
+                        year=None,
+                        season_hints=hints.season_hints,
+                        query_candidates=hints.query_candidates,
+                        reason_codes=tuple(hints.reason_codes) + ("manual_confirm",),
+                    ),
+                    reason_codes=self._merge_reason_codes(
+                        ("manual_confirm",), override_diagnostics
+                    ),
+                    final_root=matched_override.value,
+                    final_prefix=naming.format_file_prefix(matched_override.value),
+                    target_library=matched_override.target_library,
+                )
+                return self.record_decision(
+                    decision,
+                    legacy_output_root=legacy_output_root,
+                    target_output_root=target_output_root,
+                    target_library=matched_override.target_library,
+                    library_confidence=1.0,
+                    library_reason_codes=("manual_confirm",),
                 )
 
             if matched_override.action == "local":
@@ -456,6 +502,9 @@ class SmartNamingResolver:
                     for item in self._identity_candidates(self._load_identity(raw_title))
                 }
                 candidates_by_key.update({item.key: item for item in cached})
+                stored_candidate = self._load_manual_candidate(raw_title, matched_override.value)
+                if stored_candidate is not None:
+                    candidates_by_key[stored_candidate.key] = stored_candidate
                 if not candidates_by_key:
                     search_result = self._load_search_result(search_key, now, hints, search_sources)
                     candidates_by_key = {item.key: item for item in search_result.candidates}
@@ -819,6 +868,63 @@ class SmartNamingResolver:
             return tuple(getter(requested))
         return ("themoviedb", "douban")
 
+    def search_tmdb_candidates(
+        self,
+        raw_title: str,
+        config: NamingConfig,
+        limit: int = 10,
+    ) -> ProviderSearchResult:
+        """Search TMDB using the parsed directory name and the shared cache."""
+        config = NamingConfig.sanitize(config)
+        if config.mode == "off":
+            return ProviderSearchResult((), ("naming_disabled",), (), True)
+        if "themoviedb" not in config.sources:
+            return ProviderSearchResult((), ("themoviedb_not_enabled",), (), True)
+
+        hints = naming.parse_title(raw_title)
+        sources = self._provider_search_sources(("themoviedb",))
+        if "themoviedb" not in sources:
+            return ProviderSearchResult((), ("themoviedb_unavailable",), (), True)
+
+        search_key = self._query_hash(hints, sources)
+        try:
+            now = int(self._clock())
+        except (TypeError, ValueError, OverflowError):
+            now = int(time.time())
+        identity = self._load_identity(raw_title)
+        if isinstance(identity, dict) and identity.get("raw_title", raw_title) == raw_title:
+            try:
+                updated = int(identity.get("updated", 0))
+            except (TypeError, ValueError):
+                updated = 0
+            if 0 <= now - updated < self.SEARCH_TTL_SECONDS:
+                identity_candidates = tuple(
+                    candidate
+                    for candidate in self._identity_candidates(identity)
+                    if candidate.source == "themoviedb"
+                )[: max(1, min(int(limit), 10))]
+                if identity_candidates:
+                    return ProviderSearchResult(
+                        candidates=identity_candidates,
+                        errors=tuple(identity.get("source_errors", ())),
+                        attempted_sources=("themoviedb",),
+                        all_failed=False,
+                    )
+        result = self._load_search_result(
+            search_key, now, hints, sources, retry_failed=True
+        )
+        candidates = tuple(
+            candidate
+            for candidate in result.candidates
+            if candidate.source == "themoviedb"
+        )[: max(1, min(int(limit), 10))]
+        return ProviderSearchResult(
+            candidates=candidates,
+            errors=result.errors,
+            attempted_sources=result.attempted_sources,
+            all_failed=result.all_failed and not bool(candidates),
+        )
+
     def _decision_from_evaluation(
         self,
         evaluation: naming.MatchEvaluation,
@@ -1043,6 +1149,33 @@ class SmartNamingResolver:
                 continue
         return tuple(output)
 
+    def _load_manual_candidate(
+        self, raw_title: str, candidate_key: str
+    ) -> Optional[naming.MetadataCandidate]:
+        payload = self._load_json("naming_manual_decisions_v1", {})
+        if not isinstance(payload, dict) or payload.get("schema") != 1:
+            return None
+        items = payload.get("items")
+        entry = items.get(raw_title) if isinstance(items, dict) else None
+        candidate_payload = entry.get("candidate") if isinstance(entry, dict) else None
+        if not isinstance(candidate_payload, dict):
+            return None
+        try:
+            candidate = naming.MetadataCandidate.from_dict(candidate_payload)
+        except Exception:
+            return None
+        if (
+            candidate.key != candidate_key
+            or candidate.source != "themoviedb"
+            or not candidate.key.startswith("themoviedb:")
+            or not candidate.media_id
+            or not candidate.title
+            or candidate.media_type not in {"tv", "movie", "unknown"}
+            or candidate.key != f"themoviedb:{candidate.media_id}:{candidate.media_type}"
+        ):
+            return None
+        return candidate
+
     def _identity_candidates(self, identity: Dict[str, Any]) -> Tuple[naming.MetadataCandidate, ...]:
         payload = identity.get("cached_candidates") if isinstance(identity, dict) else ()
         if not isinstance(payload, list):
@@ -1070,8 +1203,11 @@ class SmartNamingResolver:
         now: int,
         hints: naming.TitleHints,
         sources: Sequence[str],
+        retry_failed: bool = False,
     ) -> ProviderSearchResult:
         cache = self._load_json("naming_search_cache_v1", {})
+        if not isinstance(cache, dict):
+            cache = {}
         if isinstance(cache, dict):
             cached = cache.get(search_key)
             if isinstance(cached, dict):
@@ -1081,25 +1217,32 @@ class SmartNamingResolver:
                     cache.pop(search_key, None)
                     self._save_data("naming_search_cache_v1", cache)
                 else:
-                    ttl = self.ERROR_TTL_SECONDS if cached.get("all_failed", False) else self.SEARCH_TTL_SECONDS
-                    try:
-                        updated = int(cached.get("updated", 0))
-                    except (TypeError, ValueError):
-                        updated = 0
-                    if now - updated < ttl:
-                        candidates = tuple(
-                            naming.MetadataCandidate.from_dict(item)
-                            for item in cached.get("candidates", ())
-                            if isinstance(item, dict)
-                        )
-                        return ProviderSearchResult(
-                            candidates=candidates,
-                            errors=tuple(cached.get("errors", ())),
-                            attempted_sources=tuple(cached.get("attempted_sources", ())),
-                            all_failed=bool(cached.get("all_failed", False)),
-                        )
-                    cache.pop(search_key, None)
-                    self._save_data("naming_search_cache_v1", cache)
+                    if retry_failed and (
+                        cached.get("all_failed", False)
+                        or not cached.get("candidates")
+                    ):
+                        cache.pop(search_key, None)
+                        self._save_data("naming_search_cache_v1", cache)
+                    else:
+                        ttl = self.ERROR_TTL_SECONDS if cached.get("all_failed", False) else self.SEARCH_TTL_SECONDS
+                        try:
+                            updated = int(cached.get("updated", 0))
+                        except (TypeError, ValueError):
+                            updated = 0
+                        if now - updated < ttl:
+                            candidates = tuple(
+                                naming.MetadataCandidate.from_dict(item)
+                                for item in cached.get("candidates", ())
+                                if isinstance(item, dict)
+                            )
+                            return ProviderSearchResult(
+                                candidates=candidates,
+                                errors=tuple(cached.get("errors", ())),
+                                attempted_sources=tuple(cached.get("attempted_sources", ())),
+                                all_failed=bool(cached.get("all_failed", False)),
+                            )
+                        cache.pop(search_key, None)
+                        self._save_data("naming_search_cache_v1", cache)
 
         result = self._provider.search(hints.query_candidates, sources)
         cache[search_key] = {
@@ -1235,7 +1378,7 @@ class SmartNamingResolver:
             "timestamp": int(self._clock()),
             "legacy_output_root": legacy_output_root,
             "target_output_root": target_output_root,
-            "target_library": target_library,
+            "target_library": target_library or decision.target_library,
             "library_confidence": library_confidence,
             "library_reason_codes": list(library_reason_codes),
         }
@@ -1257,6 +1400,45 @@ class SmartNamingResolver:
     def preview_rows(self) -> List[Dict[str, Any]]:
         rows = self._load_json("naming_preview_v1", [])
         return rows if isinstance(rows, list) else []
+
+    def mark_completed(self, raw_title: str) -> bool:
+        """Mark a successfully moved preview while retaining its history row."""
+        completed_at = int(self._clock())
+        for _attempt in range(2):
+            loaded_rows = self._load_json("naming_preview_v1", [])
+            if not isinstance(loaded_rows, list):
+                return False
+            try:
+                rows = copy.deepcopy(loaded_rows)
+            except Exception:
+                return False
+            for index, item in enumerate(rows):
+                if not isinstance(item, dict) or item.get("raw_title") != raw_title:
+                    continue
+                if item.get("completed_at") is not None:
+                    return True
+                completed = dict(item)
+                completed["completed_at"] = completed_at
+                rows[index] = completed
+                try:
+                    saved = self._save_data("naming_preview_v1", rows)
+                except Exception:
+                    saved = False
+                if saved is False:
+                    continue
+                try:
+                    verified = copy.deepcopy(self._load_json("naming_preview_v1", []))
+                except Exception:
+                    verified = []
+                if isinstance(verified, list) and any(
+                    isinstance(candidate, dict)
+                    and candidate.get("raw_title") == raw_title
+                    and candidate.get("completed_at") is not None
+                    for candidate in verified
+                ):
+                    return True
+                break
+        return False
 
     def _append_ai_error(self, raw_title: str, result: AIReviewResult) -> None:
         rows = self._load_json("naming_ai_errors_v1", [])
@@ -1361,6 +1543,7 @@ class SmartNamingResolver:
         final_root: Optional[str] = None,
         final_prefix: Optional[str] = None,
         candidate_key: str = "",
+        target_library: str = "",
     ) -> NamingDecision:
         if final_root is None:
             if status in {"auto_external", "review"} and candidate is not None:
@@ -1387,4 +1570,5 @@ class SmartNamingResolver:
             reason_codes=tuple(reason_codes),
             source_errors=tuple(source_errors),
             blocked_reason=blocked_reason,
+            target_library=target_library,
         )

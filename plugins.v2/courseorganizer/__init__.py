@@ -1,13 +1,56 @@
 import logging
+import ctypes
 import errno
+import hashlib
+import importlib
+import json
 import os
 import stat
 import re
+import sys
 import threading
 import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 _ORIGINAL_LINK = os.link
+
+try:
+    from fastapi import Body
+    from fastapi import Depends
+    from fastapi import HTTPException
+except Exception:
+    class HTTPException(Exception):
+        def __init__(self, *_, status_code: int = 500, detail: str = "") -> None:
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    def Body(default: Any = None, **_: Any) -> Any:
+        return default
+
+    def Depends(default: Any = None) -> Any:
+        return default
+
+try:
+    from app.db.user_oper import get_current_active_superuser
+except Exception:
+    get_current_active_superuser = None
+
+
+def _review_auth_unavailable_dependency() -> Any:
+    raise HTTPException(
+        status_code=503,
+        detail="课程人工复核权限依赖未就绪",
+    )
+
+REVIEW_AUTH_DEPENDENCY = (
+    get_current_active_superuser
+    if get_current_active_superuser is not None
+    else _review_auth_unavailable_dependency
+)
 
 try:
     from app.log import logger as _logger
@@ -37,6 +80,11 @@ except Exception:
 
         def update_config(self, config: Dict[str, Any]) -> None:
             self._config.update(config)
+
+try:
+    from app import schemas as _schemas
+except Exception:
+    _schemas = None
 
 from . import naming
 from .providers import (
@@ -80,6 +128,128 @@ _CHINESE_NUMERAL_MAP = {
 
 _CHILD_AUDIENCE_TERMS = ("儿童", "少儿", "幼儿", "早教", "宝宝", "亲子")
 _CHILD_AUDIENCE_RE = re.compile("|".join(re.escape(term) for term in _CHILD_AUDIENCE_TERMS))
+_MANUAL_DATA_UNSET = object()
+_NATIVE_ADAPTER_UNSET = object()
+
+
+class _MoviePilotNativeAdapter:
+    """Lazy MoviePilot v2 bridge; importing host-only modules is deferred."""
+
+    def __init__(
+        self,
+        directory_helper: Any,
+        storage_chain: Any,
+        transfer_chain: Any,
+        chain_event_type: Any,
+        event_manager: Any,
+        media_type: Any,
+    ) -> None:
+        self.directory_helper = directory_helper
+        self.storage_chain = storage_chain
+        self.transfer_chain = transfer_chain
+        self.chain_event_type = chain_event_type
+        self.event_manager = event_manager
+        self.media_type = media_type
+        self._rename_local = threading.local()
+
+    @classmethod
+    def load(cls) -> Optional["_MoviePilotNativeAdapter"]:
+        try:
+            directory_module = importlib.import_module("app.application.directory")
+        except Exception:
+            try:
+                directory_module = importlib.import_module("app.helper.directory")
+            except Exception:
+                return None
+        try:
+            storage_module = importlib.import_module("app.chain.storage")
+            transfer_module = importlib.import_module("app.chain.transfer")
+            types_module = importlib.import_module("app.schemas.types")
+            events_module = importlib.import_module("app.core.event")
+            return cls(
+                directory_helper=getattr(directory_module, "DirectoryHelper"),
+                storage_chain=getattr(storage_module, "StorageChain"),
+                transfer_chain=getattr(transfer_module, "TransferChain"),
+                chain_event_type=getattr(types_module, "ChainEventType"),
+                event_manager=getattr(events_module, "EventManager")(),
+                media_type=getattr(types_module, "MediaType", None),
+            )
+        except Exception:
+            return None
+
+    def get_directory_rules(self) -> List[Any]:
+        return list(self.directory_helper.get_dirs() or [])
+
+    def get_file_item(self, source_path: str, source_storage: str = "local") -> Any:
+        chain = self.storage_chain()
+        return chain.get_file_item(storage=source_storage, path=Path(source_path))
+
+    def manual_transfer(self, **kwargs: Any) -> Any:
+        chain = self.transfer_chain()
+        if self.media_type is not None and isinstance(kwargs.get("mtype"), str):
+            try:
+                kwargs["mtype"] = self.media_type(
+                    "电影" if kwargs["mtype"] == "movie" else "电视剧"
+                )
+            except Exception:
+                pass
+        return chain.manual_transfer(**kwargs)
+
+    @contextmanager
+    def rename_context(self, source_tree: str, final_title: str):
+        if self.event_manager is None or self.chain_event_type is None:
+            raise RuntimeError("MoviePilot rename event unavailable")
+        event_type = getattr(self.chain_event_type, "TransferRenameBuild", None)
+        if event_type is None:
+            raise RuntimeError("MoviePilot TransferRenameBuild unavailable")
+        previous = getattr(self._rename_local, "context", None)
+        context = {
+            "thread_id": threading.get_ident(),
+            "source_tree": os.path.realpath(os.path.abspath(source_tree)),
+            "title": final_title,
+        }
+        self._rename_local.context = context
+
+        def handler(event: Any) -> None:
+            active = getattr(self._rename_local, "context", None)
+            if active is not context or active["thread_id"] != threading.get_ident():
+                return
+            data = getattr(event, "event_data", None)
+            rename_dict = getattr(data, "rename_dict", None)
+            source_path = getattr(data, "source_path", None)
+            if not isinstance(rename_dict, dict) or not isinstance(
+                source_path, (str, os.PathLike)
+            ):
+                return
+            try:
+                source_path = os.fspath(source_path)
+                inside = os.path.commonpath(
+                    (active["source_tree"], os.path.realpath(os.path.abspath(source_path)))
+                ) == active["source_tree"]
+            except (OSError, ValueError):
+                inside = False
+            if inside:
+                rename_dict["title"] = active["title"]
+                rename_dict.pop("year", None)
+
+        # MoviePilot invokes dotted qualnames through its object registry. A unique
+        # top-level-style qualname keeps this scoped callback direct and collision-free.
+        handler.__qualname__ = (
+            f"_courseorganizer_rename_{id(self)}_{threading.get_ident()}"
+        )
+
+        try:
+            self.event_manager.add_event_listener(event_type, handler)
+        except Exception as exc:
+            self._rename_local.context = previous
+            raise RuntimeError("MoviePilot rename event registration failed") from exc
+        try:
+            yield
+        finally:
+            try:
+                self.event_manager.remove_event_listener(event_type, handler)
+            finally:
+                self._rename_local.context = previous
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -102,7 +272,7 @@ class CourseOrganizer(_PluginBase):
     plugin_config_prefix = "courseorganizer_"
     auth_level = 1
     plugin_order = 90
-    plugin_version = "1.5.4"
+    plugin_version = "1.5.14"
     plugin_desc = "稳定后识别、分类并整理到电视剧、电影或儿童媒体库"
     plugin_author = "OpenAI"
     plugin_icon = "icons/courseorganizer.svg"
@@ -115,8 +285,15 @@ class CourseOrganizer(_PluginBase):
     DEFAULT_TV_OUTPUT = "/volume1/TV"
     DEFAULT_MOVIE_OUTPUT = "/volume1/Movies"
     DEFAULT_CHILDREN_OUTPUT = "/volume1/儿童"
+    MANUAL_DECISIONS_KEY = "naming_manual_decisions_v1"
+    MANUAL_DECISIONS_SCHEMA = 1
+    MANUAL_DECISIONS_MAX = 500
+    MANUAL_PERSIST_ATTEMPTS = 2
 
-    _thread_lock = threading.Lock()
+    _thread_lock = threading.RLock()
+    # Protects the manual-decisions read-modify-write sequence; independent from the
+    # move lock so that TMDB search/associate never block a running confirmation move.
+    _review_data_lock = threading.RLock()
     # MoviePilot update_config persists only; this lock linearizes persistence and cancellation.
     _run_once_lock = threading.Lock()
     _run_once_timer: Optional[threading.Timer] = None
@@ -133,6 +310,11 @@ class CourseOrganizer(_PluginBase):
         self._metadata_provider_override = kwargs.pop("metadata_provider", None)
         self._ai_reviewer_override = kwargs.pop("ai_reviewer", None)
         self._library_classifier_override = kwargs.pop("library_classifier", None)
+        self._native_adapter_override = kwargs.pop(
+            "native_adapter", _NATIVE_ADAPTER_UNSET
+        )
+        self._native_adapter: Any = None
+        self._native_adapter_loaded = False
         self._clock = kwargs.pop("clock", time.time)
         super().__init__(*args, **kwargs)
         self._config_snapshot: Dict[str, Any] = self._normalize_config(kwargs.get("config", {}))
@@ -141,6 +323,25 @@ class CourseOrganizer(_PluginBase):
         self._library_classifier: Optional[MoviePilotLibraryClassifier] = None
         self._logger = _logger
         self._run_config_local = threading.local()
+
+    def _get_native_adapter(self) -> Any:
+        if self._native_adapter_override is not _NATIVE_ADAPTER_UNSET:
+            return self._native_adapter_override
+        if not self._native_adapter_loaded:
+            self._native_adapter = _MoviePilotNativeAdapter.load()
+            self._native_adapter_loaded = True
+        return self._native_adapter
+
+    def _moviepilot_host_present(self) -> bool:
+        if self._native_adapter_override is not _NATIVE_ADAPTER_UNSET:
+            return True
+        for module_name in ("app.application.directory", "app.helper.directory"):
+            try:
+                importlib.import_module(module_name)
+                return True
+            except Exception:
+                continue
+        return False
 
     def _load_plugin_data(self, key: str, default: Any) -> Any:
         try:
@@ -251,15 +452,1949 @@ class CourseOrganizer(_PluginBase):
     def get_command() -> List[Dict[str, Any]]:
         return []
 
+    @staticmethod
+    def get_render_mode() -> Tuple[str, str]:
+        return "vue", "dist/assets"
+
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        return [
+            {
+                "path": "/review",
+                "endpoint": self.get_review_route,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取课程人工复核预览",
+            },
+            {
+                "path": "/review",
+                "endpoint": self.save_review_route,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "保存课程人工复核决定",
+            },
+            {
+                "path": "/review/refresh",
+                "endpoint": self.refresh_review_route,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "重新扫描课程人工复核预览",
+            },
+            {
+                "path": "/review/tmdb/search",
+                "endpoint": self.search_tmdb_route,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "按课程名称搜索 TMDB 候选",
+            },
+            {
+                "path": "/review/tmdb/associate",
+                "endpoint": self.associate_tmdb_route,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "保存人工 TMDB 关联",
+            },
+        ]
+
+    @staticmethod
+    def _review_response(success: bool, data: Any = None, message: str = "") -> Any:
+        if _schemas is not None and hasattr(_schemas, "Response"):
+            return _schemas.Response(success=success, data=data, message=message)
+        return {"success": success, "data": data, "message": message}
+
+    @staticmethod
+    def _is_active_superuser(user: Any) -> bool:
+        if isinstance(user, dict):
+            return bool(user.get("is_superuser")) and bool(user.get("is_active", True))
+        return bool(getattr(user, "is_superuser", False)) and bool(
+            getattr(user, "is_active", True)
+        )
+
+    @classmethod
+    def _require_review_superuser(cls, user: Any) -> None:
+        if not cls._is_active_superuser(user):
+            raise HTTPException(status_code=403, detail="需要超级管理员权限")
+
+    def get_review_route(self, user: Any = Depends(REVIEW_AUTH_DEPENDENCY)) -> Any:
+        self._require_review_superuser(user)
+        return self.get_review()
+
+    def refresh_review_route(self, user: Any = Depends(REVIEW_AUTH_DEPENDENCY)) -> Any:
+        self._require_review_superuser(user)
+        return self.refresh_review()
+
+    def save_review_route(
+        self,
+        payload: Optional[Dict[str, Any]] = Body(default=None),
+        user: Any = Depends(REVIEW_AUTH_DEPENDENCY),
+    ) -> Any:
+        self._require_review_superuser(user)
+        return self.save_review(payload)
+
+    def search_tmdb_route(
+        self,
+        payload: Optional[Dict[str, Any]] = Body(default=None),
+        user: Any = Depends(REVIEW_AUTH_DEPENDENCY),
+    ) -> Any:
+        self._require_review_superuser(user)
+        return self.search_tmdb(payload)
+
+    def associate_tmdb_route(
+        self,
+        payload: Optional[Dict[str, Any]] = Body(default=None),
+        user: Any = Depends(REVIEW_AUTH_DEPENDENCY),
+    ) -> Any:
+        self._require_review_superuser(user)
+        return self.associate_tmdb(payload)
+
+    @classmethod
+    def _review_revision(cls, row: Dict[str, Any]) -> str:
+        material = {
+            key: row.get(key)
+            for key in (
+                "raw_title",
+                "final_title",
+                "target_library",
+                "target_output_root",
+                "status",
+                "reason_codes",
+                "source",
+                "media_id",
+                "media_type",
+                "source_path",
+                "source_identity",
+                "source_snapshot_digest",
+                "source_manifest_digest",
+                "source_directory_manifest_digest",
+            )
+        }
+        payload = json.dumps(
+            material,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _review_status_label(status: str, target_library: str = "") -> str:
+        if status == "ignore":
+            return "已跳过"
+        if status in {"auto_external", "local_fallback"} and target_library in naming.MANUAL_TARGET_LIBRARIES:
+            return "可以整理"
+        return "需要确认"
+
+    @staticmethod
+    def _recognition_source_label(
+        source: str,
+        reason_codes: Any = (),
+        manual_action: str = "",
+    ) -> str:
+        if manual_action == "confirm":
+            return "人工"
+        if manual_action == "candidate":
+            return "TMDB"
+        reasons = {
+            str(item).strip().lower()
+            for item in (reason_codes if isinstance(reason_codes, (list, tuple, set)) else ())
+        }
+        if "ai_review" in reasons:
+            return "DeepSeek"
+        normalized = str(source or "").strip().lower()
+        if normalized == "themoviedb":
+            return "TMDB"
+        if normalized == "douban":
+            return "豆瓣"
+        return "本地"
+
+    @staticmethod
+    def _directory_rule_value(rule: Any, key: str, default: Any = None) -> Any:
+        if isinstance(rule, dict):
+            return rule.get(key, default)
+        return getattr(rule, key, default)
+
+    def _load_moviepilot_directory_rules(self) -> Tuple[List[Any], str]:
+        """Read MoviePilot's directory rules without making them a plugin setting."""
+        try:
+            adapter = self._get_native_adapter()
+            if adapter is None or not hasattr(adapter, "get_directory_rules"):
+                raise RuntimeError("native adapter unavailable")
+            return list(adapter.get_directory_rules() or []), ""
+        except Exception as exc:
+            self._logger.warning(
+                "CourseOrganizer[event=directory_rules_unavailable] reason=%s",
+                exc.__class__.__name__,
+            )
+            return [], "MoviePilot 目录规则暂时不可读取"
+
+    @classmethod
+    def _directory_rule_library(cls, rule: Any) -> str:
+        name = str(cls._directory_rule_value(rule, "name", "") or "")
+        # The MoviePilot directory alias is the user's explicit library
+        # declaration.  Do not infer a child library from an arbitrary path
+        # segment such as ``courses``; paths are deployment-specific and can
+        # be used by an ordinary TV rule.
+        descriptor = name.lower()
+        if any(
+            token in descriptor
+            for token in ("儿童", "少儿", "幼儿", "课程", "早教", "宝宝", "亲子")
+        ):
+            return "children"
+        media_type = str(
+            cls._directory_rule_value(rule, "media_type", "") or ""
+        ).strip()
+        if media_type == "电影":
+            return "movie"
+        if media_type == "电视剧":
+            return "tv"
+        return ""
+
+    def _moviepilot_directory_context(self) -> Dict[str, Any]:
+        rules, load_error = self._load_moviepilot_directory_rules()
+        labels = {"tv": "电视剧", "movie": "电影", "children": "儿童课程"}
+        grouped: Dict[str, List[Dict[str, Any]]] = {key: [] for key in labels}
+        summaries: List[Dict[str, Any]] = []
+        issues: List[str] = []
+
+        for rule in rules:
+            library = self._directory_rule_library(rule)
+            if not library:
+                continue
+            download_path = str(
+                self._directory_rule_value(rule, "download_path", "") or ""
+            ).strip()
+            library_path = str(
+                self._directory_rule_value(rule, "library_path", "") or ""
+            ).strip()
+            storage = str(
+                self._directory_rule_value(rule, "storage", "local") or "local"
+            ).strip()
+            library_storage = str(
+                self._directory_rule_value(rule, "library_storage", "local")
+                or "local"
+            ).strip()
+            if not download_path or not library_path:
+                issues.append(f"{labels[library]}规则缺少来源或目标目录")
+                continue
+            if storage != "local" or library_storage != "local":
+                issues.append(f"{labels[library]}规则不是本地存储，当前复核台不能处理")
+                continue
+            summary = {
+                "title": labels[library],
+                "value": library,
+                "name": str(
+                    self._directory_rule_value(rule, "name", "") or labels[library]
+                ),
+                "download_path": download_path,
+                "path": library_path,
+                "monitor_type": str(
+                    self._directory_rule_value(rule, "monitor_type", "") or ""
+                ),
+                "storage": storage,
+                "library_storage": library_storage,
+                "transfer_type": str(
+                    self._directory_rule_value(rule, "transfer_type", "") or ""
+                ),
+                "renaming": bool(self._directory_rule_value(rule, "renaming", False)),
+                "scraping": bool(self._directory_rule_value(rule, "scraping", False)),
+                "notify": bool(self._directory_rule_value(rule, "notify", True)),
+                "library_type_folder": bool(
+                    self._directory_rule_value(rule, "library_type_folder", False)
+                ),
+                "library_category_folder": bool(
+                    self._directory_rule_value(rule, "library_category_folder", False)
+                ),
+            }
+            grouped[library].append(summary)
+            summaries.append(summary)
+
+        selected: Dict[str, Dict[str, Any]] = {}
+        for library, candidates in grouped.items():
+            if not candidates:
+                issues.append(f"缺少{labels[library]}目录规则")
+            elif len(candidates) > 1:
+                issues.append(f"{labels[library]}存在多条匹配规则，请在 MoviePilot 中保留一条明确规则")
+            else:
+                selected[library] = candidates[0]
+
+        source_paths = {
+            item["download_path"] for item in selected.values() if item["download_path"]
+        }
+        incoming = next(iter(source_paths)) if len(source_paths) == 1 else ""
+        if len(source_paths) > 1:
+            issues.append("三类规则的来源目录不一致，无法确定唯一待处理目录")
+
+        if load_error:
+            issues.insert(0, load_error)
+        libraries = [selected[key] for key in ("tv", "movie", "children") if key in selected]
+        return {
+            "available": not load_error,
+            "incoming": incoming,
+            "libraries": libraries,
+            "rules": summaries,
+            "selected": selected,
+            "ready": not issues and len(selected) == len(labels) and bool(incoming),
+            "issues": list(dict.fromkeys(issues)),
+            "message": "；".join(dict.fromkeys(issues)),
+            "settings_url": "#/setting",
+            "monitoring_enabled": any(bool(item["monitor_type"]) for item in summaries),
+        }
+
+    def _review_path_config(
+        self, context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        config = self._get_config()
+        directory_context = context or self._moviepilot_directory_context()
+        if not directory_context.get("available"):
+            return config
+        selected = directory_context.get("selected", {})
+        config["incoming"] = str(directory_context.get("incoming", ""))
+        for library, key in (
+            ("tv", "tv_output"),
+            ("movie", "movie_output"),
+            ("children", "children_output"),
+        ):
+            config[key] = str(selected.get(library, {}).get("path", ""))
+        return config
+
+    def _review_source_directory_ok(self, raw_title: str) -> bool:
+        """True when the source directory for a preview row still exists.
+
+        A missing directory means the residual preview row should stay hidden;
+        an existing directory whose safe snapshot is temporarily unavailable is
+        surfaced as "源目录待稳定" so the user can see the item.
+        """
+        config = self._review_path_config()
+        incoming = str(config.get("incoming", "") or "")
+        if not incoming or not raw_title:
+            return False
+        return os.path.isdir(os.path.join(incoming, raw_title))
+
+    @staticmethod
+    def _source_identity(path: str) -> Optional[Dict[str, int]]:
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except (OSError, TypeError, ValueError):
+            return None
+        if not stat.S_ISDIR(info.st_mode):
+            return None
+        try:
+            ctime_ns = int(info.st_ctime_ns)
+        except AttributeError:
+            ctime_ns = int(float(info.st_ctime) * 1_000_000_000)
+        return {
+            "st_dev": int(info.st_dev),
+            "st_ino": int(info.st_ino),
+            "st_ctime_ns": ctime_ns,
+        }
+
+    @staticmethod
+    def _safe_log_value(value: Any) -> str:
+        text = str(value)
+        valid, _ = naming.validate_manual_raw_title(text)
+        return text if valid else ascii(text)
+
+    @staticmethod
+    def _manifest_stat_tuple(
+        relative_path: str, info: os.stat_result
+    ) -> Tuple[str, int, int, int, int, int]:
+        try:
+            ctime_ns = int(info.st_ctime_ns)
+            mtime_ns = int(info.st_mtime_ns)
+        except AttributeError:
+            ctime_ns = int(float(info.st_ctime) * 1_000_000_000)
+            mtime_ns = int(float(info.st_mtime) * 1_000_000_000)
+        return (
+            relative_path,
+            int(info.st_dev),
+            int(info.st_ino),
+            ctime_ns,
+            int(info.st_size),
+            mtime_ns,
+        )
+
+    @classmethod
+    def _manifest_stat_matches(
+        cls, info: os.stat_result, expected: Tuple[str, int, int, int, int, int]
+    ) -> bool:
+        return cls._manifest_stat_tuple(expected[0], info) == expected
+
+    @staticmethod
+    def _file_stat_matches(left: os.stat_result, right: os.stat_result) -> bool:
+        try:
+            return (
+                stat.S_ISREG(left.st_mode)
+                and stat.S_ISREG(right.st_mode)
+                and int(left.st_dev) == int(right.st_dev)
+                and int(left.st_ino) == int(right.st_ino)
+                and int(left.st_ctime_ns) == int(right.st_ctime_ns)
+                and int(left.st_size) == int(right.st_size)
+                and int(left.st_mtime_ns) == int(right.st_mtime_ns)
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+
+    @staticmethod
+    def _file_stat_matches_without_ctime(
+        left: os.stat_result, right: os.stat_result
+    ) -> bool:
+        try:
+            return (
+                stat.S_ISREG(left.st_mode)
+                and stat.S_ISREG(right.st_mode)
+                and int(left.st_dev) == int(right.st_dev)
+                and int(left.st_ino) == int(right.st_ino)
+                and int(left.st_size) == int(right.st_size)
+                and int(left.st_mtime_ns) == int(right.st_mtime_ns)
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+
+    @classmethod
+    def _scan_manifest_dir(
+        cls,
+        directory_fd: int,
+        relative_prefix: str = "",
+        excluded_root: Optional[Tuple[str, Tuple[int, int]]] = None,
+        diagnostic: Optional[List[str]] = None,
+    ) -> Optional[
+        Tuple[
+            List[Tuple[str, int, int, int, int, int]],
+            List[Tuple[str, int, int]],
+        ]
+    ]:
+        """Build a no-follow regular-file manifest while rejecting read races."""
+        def _note(reason: str) -> None:
+            if diagnostic is not None:
+                diagnostic.append(reason)
+
+        try:
+            before = os.fstat(directory_fd)
+            if not stat.S_ISDIR(before.st_mode):
+                _note(f"not-directory:{relative_prefix or '.'}")
+                return None
+            with os.scandir(directory_fd) as entries:
+                children = sorted(entries, key=lambda entry: entry.name)
+            manifest: List[Tuple[str, int, int, int, int, int]] = []
+            directories: List[Tuple[str, int, int]] = []
+            if relative_prefix:
+                directories.append(
+                    (
+                        relative_prefix,
+                        int(before.st_dev),
+                        int(before.st_ino),
+                    )
+                )
+            open_flags = (
+                getattr(os, "O_NOFOLLOW", 0)
+                | os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            for entry in children:
+                relative_path = (
+                    f"{relative_prefix}/{entry.name}"
+                    if relative_prefix
+                    else entry.name
+                ).replace(os.sep, "/")
+                info = entry.stat(follow_symlinks=False)
+                if (
+                    not relative_prefix
+                    and excluded_root is not None
+                    and entry.name == excluded_root[0]
+                    and stat.S_ISDIR(info.st_mode)
+                    and (info.st_dev, info.st_ino) == excluded_root[1]
+                ):
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    _note(f"symlink:{relative_path}")
+                    return None
+                if stat.S_ISDIR(info.st_mode):
+                    child_fd = None
+                    try:
+                        child_fd = os.open(
+                            entry.name,
+                            open_flags | getattr(os, "O_DIRECTORY", 0),
+                            dir_fd=directory_fd,
+                        )
+                        child_manifest = cls._scan_manifest_dir(
+                            child_fd, relative_path, diagnostic=diagnostic
+                        )
+                    finally:
+                        if child_fd is not None:
+                            os.close(child_fd)
+                    if child_manifest is None:
+                        return None
+                    manifest.extend(child_manifest[0])
+                    directories.extend(child_manifest[1])
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    _note(f"non-regular:{relative_path}")
+                    return None
+                file_fd = None
+                try:
+                    file_fd = os.open(entry.name, open_flags, dir_fd=directory_fd)
+                    first = os.fstat(file_fd)
+                    expected = cls._manifest_stat_tuple(relative_path, info)
+                    if not stat.S_ISREG(first.st_mode) or not cls._manifest_stat_matches(
+                        first, expected
+                    ):
+                        _note(f"file-race:{relative_path}")
+                        return None
+                    second = os.fstat(file_fd)
+                    if not cls._manifest_stat_matches(second, expected):
+                        _note(f"file-race:{relative_path}")
+                        return None
+                finally:
+                    if file_fd is not None:
+                        os.close(file_fd)
+                manifest.append(expected)
+            after = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(after.st_mode)
+                or (before.st_dev, before.st_ino, before.st_ctime_ns, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_ctime_ns, after.st_mtime_ns)
+            ):
+                _note(f"directory-race:{relative_prefix or '.'}")
+                return None
+            return manifest, directories
+        except (OSError, TypeError, NotImplementedError, ValueError, UnicodeError) as exc:
+            _note(f"error:{relative_prefix or '.'}:{exc.__class__.__name__}")
+            return None
+
+    def _source_tree_manifest(
+        self, source_path: str
+    ) -> Optional[
+        Tuple[
+            Tuple[Tuple[str, int, int, int, int, int], ...],
+            Tuple[Tuple[str, int, int], ...],
+        ]
+    ]:
+        bound = self._open_bound_root(source_path)
+        if bound is None:
+            self._logger.warning(
+                "CourseOrganizer[event=source_manifest_open_failed] source_path=%s",
+                self._safe_log_value(source_path),
+            )
+            return None
+        try:
+            diagnostic: List[str] = []
+            tree = self._scan_manifest_dir(bound["fd"], diagnostic=diagnostic)
+            if tree is None or not self._bound_root_is_current(bound):
+                if diagnostic:
+                    self._logger.warning(
+                        "CourseOrganizer[event=source_manifest_rejected] source_path=%s reasons=%s",
+                        self._safe_log_value(source_path),
+                        ",".join(diagnostic[-8:]),
+                    )
+                else:
+                    self._logger.warning(
+                        "CourseOrganizer[event=source_manifest_rejected] source_path=%s reasons=bound_root_changed",
+                        self._safe_log_value(source_path),
+                    )
+                return None
+            manifest, directories = tree
+            manifest.sort(key=lambda item: item[0])
+            directories.sort(key=lambda item: item[0])
+            return tuple(manifest), tuple(directories)
+        except (OSError, TypeError, NotImplementedError, ValueError, UnicodeError):
+            return None
+        finally:
+            for fd in (bound.get("parent_fd"), bound.get("fd")):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+    def _source_manifest(
+        self, source_path: str
+    ) -> Optional[Tuple[Tuple[str, int, int, int, int, int], ...]]:
+        tree = self._source_tree_manifest(source_path)
+        return tree[0] if tree is not None else None
+
+    @staticmethod
+    def _manifest_digest(
+        manifest: Tuple[Tuple[str, int, int, int, int, int], ...]
+    ) -> str:
+        payload = json.dumps(
+            [list(item) for item in manifest],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _directory_manifest_digest(
+        manifest: Tuple[Tuple[str, int, int], ...]
+    ) -> str:
+        payload = json.dumps(
+            [list(item) for item in manifest],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _coerce_source_manifest(
+        cls, value: Any
+    ) -> Optional[Tuple[Tuple[str, int, int, int, int, int], ...]]:
+        if not isinstance(value, (list, tuple)):
+            return None
+        result: List[Tuple[str, int, int, int, int, int]] = []
+        for item in value:
+            if isinstance(item, dict):
+                fields = (
+                    item.get("relative_path"),
+                    item.get("st_dev"),
+                    item.get("st_ino"),
+                    item.get("st_ctime_ns"),
+                    item.get("st_size"),
+                    item.get("st_mtime_ns"),
+                )
+            elif isinstance(item, (list, tuple)) and len(item) == 6:
+                fields = tuple(item)
+            else:
+                return None
+            relative_path = fields[0]
+            if (
+                not isinstance(relative_path, str)
+                or not relative_path
+                or os.path.isabs(relative_path)
+                or relative_path in {".", ".."}
+                or relative_path.startswith("../")
+                or "\\" in relative_path
+            ):
+                return None
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in fields[1:]
+            ):
+                return None
+            numbers = tuple(fields[1:])
+            if any(value < 0 for value in numbers):
+                return None
+            result.append((relative_path, *numbers))
+        normalized = tuple(sorted(result, key=lambda item: item[0]))
+        if len({item[0] for item in normalized}) != len(normalized):
+            return None
+        return normalized
+
+    @classmethod
+    def _coerce_source_directory_manifest(
+        cls, value: Any
+    ) -> Optional[Tuple[Tuple[str, int, int], ...]]:
+        if not isinstance(value, (list, tuple)):
+            return None
+        result: List[Tuple[str, int, int]] = []
+        for item in value:
+            if isinstance(item, dict):
+                fields = (
+                    item.get("relative_path"),
+                    item.get("st_dev"),
+                    item.get("st_ino"),
+                )
+            elif isinstance(item, (list, tuple)) and len(item) == 3:
+                fields = tuple(item)
+            else:
+                return None
+            relative_path = fields[0]
+            if (
+                not isinstance(relative_path, str)
+                or not relative_path
+                or os.path.isabs(relative_path)
+                or relative_path in {".", ".."}
+                or relative_path.startswith("../")
+                or "\\" in relative_path
+            ):
+                return None
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in fields[1:]
+            ):
+                return None
+            if any(value < 0 for value in fields[1:]):
+                return None
+            result.append((relative_path, fields[1], fields[2]))
+        normalized = tuple(sorted(result, key=lambda item: item[0]))
+        if len({item[0] for item in normalized}) != len(normalized):
+            return None
+        return normalized
+
+    @staticmethod
+    def _snapshot_digest(signature: Any) -> str:
+        payload = json.dumps(
+            signature if isinstance(signature, (list, tuple)) else [],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _current_source_binding(self, raw_title: str) -> Optional[Dict[str, Any]]:
+        config = self._review_path_config()
+        incoming = str(config.get("incoming", ""))
+        if not incoming or not os.path.isdir(incoming):
+            return None
+        source_path = os.path.join(incoming, raw_title)
+        if not self._is_within_realpath(incoming, source_path):
+            return None
+        source_realpath = os.path.realpath(os.path.abspath(source_path))
+        incoming_realpath = os.path.realpath(os.path.abspath(incoming))
+        if source_realpath == incoming_realpath:
+            return None
+        identity = self._source_identity(source_path)
+        if identity is None:
+            return None
+        tree = self._source_tree_manifest(source_realpath)
+        if tree is None:
+            return None
+        manifest, directory_manifest = tree
+        signature = [
+            (item[0], item[4], item[5])
+            for item in sorted(manifest, key=lambda item: self._natural_key(item[0]))
+        ]
+        return {
+            "source_path": source_realpath,
+            "source_identity": identity,
+            "source_snapshot_digest": self._snapshot_digest(signature),
+            "source_manifest": manifest,
+            "source_manifest_digest": self._manifest_digest(manifest),
+            "source_directory_manifest": directory_manifest,
+            "source_directory_manifest_digest": self._directory_manifest_digest(
+                directory_manifest
+            ),
+        }
+
+    @staticmethod
+    def _source_bindings_equal(
+        current: Optional[Dict[str, Any]], expected: Dict[str, Any]
+    ) -> bool:
+        keys = (
+            "source_path",
+            "source_identity",
+            "source_snapshot_digest",
+            "source_manifest_digest",
+            "source_manifest",
+            "source_directory_manifest_digest",
+            "source_directory_manifest",
+        )
+        if (
+            not isinstance(current, dict)
+            or not isinstance(expected, dict)
+            or any(key not in current or key not in expected for key in keys)
+        ):
+            return False
+        return all(current[key] == expected[key] for key in keys)
+
+    def _source_binding_matches(
+        self,
+        raw_title: str,
+        expected: Dict[str, Any],
+        current: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        return self._source_bindings_equal(
+            current if current is not None else self._current_source_binding(raw_title),
+            expected,
+        )
+
+    @staticmethod
+    def _manual_binding(decision: naming.ManualOverride) -> Dict[str, Any]:
+        return {
+            "source_path": decision.source_path,
+            "source_identity": dict(decision.source_identity),
+            "source_snapshot_digest": decision.source_snapshot_digest,
+            "source_manifest": tuple(decision.source_manifest),
+            "source_manifest_digest": decision.source_manifest_digest,
+            "source_directory_manifest": tuple(decision.source_directory_manifest),
+            "source_directory_manifest_digest": decision.source_directory_manifest_digest,
+        }
+
+    def _consume_manual_decision(
+        self, raw_title: str, expected_binding: Dict[str, Any]
+    ) -> bool:
+        try:
+            payload = self.get_data(self.MANUAL_DECISIONS_KEY)
+        except Exception:
+            payload = None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != self.MANUAL_DECISIONS_SCHEMA
+            or not isinstance(payload.get("items"), dict)
+        ):
+            self._logger.error(
+                "CourseOrganizer[event=manual_review_consume_failed] item_course_repr=%s reason=invalid_store",
+                ascii(raw_title),
+            )
+            return False
+        entry = payload["items"].get(raw_title)
+        if not isinstance(entry, dict) or entry.get("action") != "confirm":
+            self._logger.warning(
+                "CourseOrganizer[event=manual_review_consume_skipped] item_course_repr=%s reason=decision_changed",
+                ascii(raw_title),
+            )
+            return False
+        stored_binding = {
+            "source_path": entry.get("source_path"),
+            "source_identity": entry.get("source_identity"),
+            "source_snapshot_digest": entry.get("source_snapshot_digest"),
+            "source_manifest": self._coerce_source_manifest(entry.get("source_manifest")),
+            "source_manifest_digest": entry.get("source_manifest_digest"),
+            "source_directory_manifest": self._coerce_source_directory_manifest(
+                entry.get("source_directory_manifest")
+            ),
+            "source_directory_manifest_digest": entry.get(
+                "source_directory_manifest_digest"
+            ),
+        }
+        if stored_binding != expected_binding:
+            self._logger.warning(
+                "CourseOrganizer[event=manual_review_consume_skipped] item_course_repr=%s reason=identity_mismatch",
+                ascii(raw_title),
+            )
+            return False
+        items = dict(payload["items"])
+        del items[raw_title]
+        next_payload = {"schema": self.MANUAL_DECISIONS_SCHEMA, "items": items}
+        for attempt in range(self.MANUAL_PERSIST_ATTEMPTS):
+            try:
+                self.save_data(self.MANUAL_DECISIONS_KEY, next_payload)
+            except Exception as exc:
+                self._logger.warning(
+                    "CourseOrganizer[event=manual_review_consume_retry] item_course_repr=%s attempt=%d reason=%s",
+                    ascii(raw_title),
+                    attempt + 1,
+                    exc.__class__.__name__,
+                )
+            if self._manual_decision_consumed(raw_title):
+                self._logger.info(
+                    "CourseOrganizer[event=manual_review_consumed] item_course_repr=%s",
+                    ascii(raw_title),
+                )
+                return True
+            if attempt + 1 < self.MANUAL_PERSIST_ATTEMPTS:
+                self._logger.warning(
+                    "CourseOrganizer[event=manual_review_consume_retry] item_course_repr=%s attempt=%d reason=not_verified",
+                    ascii(raw_title),
+                    attempt + 1,
+                )
+        self._logger.error(
+            "CourseOrganizer[event=manual_review_consume_failed] item_course_repr=%s reason=not_verified",
+            ascii(raw_title),
+        )
+        return False
+
+    def _manual_decision_consumed(self, raw_title: str) -> bool:
+        try:
+            payload = self.get_data(self.MANUAL_DECISIONS_KEY)
+        except Exception:
+            return False
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("schema") == self.MANUAL_DECISIONS_SCHEMA
+            and isinstance(payload.get("items"), dict)
+            and raw_title not in payload["items"]
+        )
+
+    def _legacy_review_override(self, raw_title: str) -> Optional[naming.ManualOverride]:
+        config = self._get_config()
+        parsed = naming.parse_manual_overrides(config.get("naming_manual_overrides", ""))
+        for item in parsed.overrides:
+            if item.raw_title == raw_title:
+                return item
+        return None
+
+    def _manual_decision_for(
+        self, raw_title: str, payload: Any = _MANUAL_DATA_UNSET
+    ) -> Optional[naming.ManualOverride]:
+        """Load structured review data; malformed matching entries fail closed."""
+        if payload is _MANUAL_DATA_UNSET:
+            try:
+                payload = self.get_data(self.MANUAL_DECISIONS_KEY)
+            except Exception:
+                return naming.ManualOverride(raw_title, "invalid")
+        if payload is None:
+            return None
+        if not isinstance(payload, dict) or payload.get("schema") != self.MANUAL_DECISIONS_SCHEMA:
+            return naming.ManualOverride(raw_title, "invalid")
+        items = payload.get("items")
+        if not isinstance(items, dict):
+            return naming.ManualOverride(raw_title, "invalid")
+        entry = items.get(raw_title)
+        if entry is None:
+            return None
+        if not isinstance(entry, dict):
+            return naming.ManualOverride(raw_title, "invalid")
+        action = entry.get("action")
+        source_revision = entry.get("source_revision")
+        if action not in {"confirm", "ignore", "candidate"} or not isinstance(source_revision, str) or not source_revision:
+            return naming.ManualOverride(raw_title, "invalid")
+        source_path = entry.get("source_path")
+        source_identity = entry.get("source_identity")
+        source_snapshot_digest = entry.get("source_snapshot_digest")
+        source_manifest = self._coerce_source_manifest(entry.get("source_manifest"))
+        source_manifest_digest = entry.get("source_manifest_digest")
+        source_directory_manifest = self._coerce_source_directory_manifest(
+            entry.get("source_directory_manifest")
+        )
+        source_directory_manifest_digest = entry.get(
+            "source_directory_manifest_digest"
+        )
+        if (
+            not isinstance(source_path, str)
+            or not os.path.isabs(source_path)
+            or not isinstance(source_identity, dict)
+            or not isinstance(source_snapshot_digest, str)
+            or not source_snapshot_digest
+            or source_manifest is None
+            or not isinstance(source_manifest_digest, str)
+            or not source_manifest_digest
+            or source_manifest_digest != self._manifest_digest(source_manifest)
+            or source_directory_manifest is None
+            or not isinstance(source_directory_manifest_digest, str)
+            or not source_directory_manifest_digest
+            or source_directory_manifest_digest
+            != self._directory_manifest_digest(source_directory_manifest)
+        ):
+            return naming.ManualOverride(raw_title, "invalid")
+        try:
+            identity_values = {
+                key: source_identity[key]
+                for key in ("st_dev", "st_ino", "st_ctime_ns")
+            }
+        except (KeyError, TypeError):
+            return naming.ManualOverride(raw_title, "invalid")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in identity_values.values()
+        ):
+            return naming.ManualOverride(raw_title, "invalid")
+        normalized_identity = identity_values
+        if any(value < 0 for value in normalized_identity.values()):
+            return naming.ManualOverride(raw_title, "invalid")
+        try:
+            updated_at = int(entry.get("updated_at"))
+        except (TypeError, ValueError):
+            return naming.ManualOverride(raw_title, "invalid")
+        if updated_at < 0:
+            return naming.ManualOverride(raw_title, "invalid")
+        if action == "ignore":
+            if any(key in entry for key in ("final_title", "target_library")) and (
+                entry.get("final_title", "") or entry.get("target_library", "")
+            ):
+                return naming.ManualOverride(raw_title, "invalid")
+            return naming.ManualOverride(
+                raw_title,
+                "ignore",
+                source_revision=source_revision,
+                source_path=source_path,
+                source_identity=tuple(sorted(normalized_identity.items())),
+                source_snapshot_digest=source_snapshot_digest,
+                source_manifest=source_manifest,
+                source_manifest_digest=source_manifest_digest,
+                source_directory_manifest=source_directory_manifest,
+                source_directory_manifest_digest=source_directory_manifest_digest,
+            )
+        if action == "candidate":
+            candidate = self._manual_candidate_for(raw_title, payload)
+            target_library = entry.get("target_library", "")
+            if target_library is None:
+                target_library = ""
+            if not isinstance(target_library, str) or (
+                target_library and target_library not in naming.MANUAL_TARGET_LIBRARIES
+            ):
+                return naming.ManualOverride(raw_title, "invalid")
+            candidate_key = entry.get("candidate_key")
+            if candidate is None or not isinstance(candidate_key, str):
+                return naming.ManualOverride(raw_title, "invalid")
+            return naming.ManualOverride(
+                raw_title,
+                "candidate",
+                candidate_key,
+                target_library,
+                source_revision,
+                source_path=source_path,
+                source_identity=tuple(sorted(normalized_identity.items())),
+                source_snapshot_digest=source_snapshot_digest,
+                source_manifest=source_manifest,
+                source_manifest_digest=source_manifest_digest,
+                source_directory_manifest=source_directory_manifest,
+                source_directory_manifest_digest=source_directory_manifest_digest,
+            )
+        final_title = entry.get("final_title")
+        target_library = entry.get("target_library")
+        valid_name, _ = naming.validate_manual_name(final_title)
+        if not valid_name or target_library not in naming.MANUAL_TARGET_LIBRARIES:
+            return naming.ManualOverride(raw_title, "invalid")
+        return naming.ManualOverride(
+            raw_title,
+            "confirm",
+            final_title,
+            target_library,
+            source_revision,
+            source_path=source_path,
+            source_identity=tuple(sorted(normalized_identity.items())),
+            source_snapshot_digest=source_snapshot_digest,
+            source_manifest=source_manifest,
+            source_manifest_digest=source_manifest_digest,
+            source_directory_manifest=source_directory_manifest,
+            source_directory_manifest_digest=source_directory_manifest_digest,
+        )
+
+    def _manual_candidate_for(
+        self,
+        raw_title: str,
+        payload: Any = _MANUAL_DATA_UNSET,
+    ) -> Optional[naming.MetadataCandidate]:
+        if payload is _MANUAL_DATA_UNSET:
+            try:
+                payload = self.get_data(self.MANUAL_DECISIONS_KEY)
+            except Exception:
+                return None
+        if not isinstance(payload, dict) or payload.get("schema") != self.MANUAL_DECISIONS_SCHEMA:
+            return None
+        items = payload.get("items")
+        entry = items.get(raw_title) if isinstance(items, dict) else None
+        if not isinstance(entry, dict) or entry.get("action") not in {"candidate", "confirm"}:
+            return None
+        candidate_payload = entry.get("candidate")
+        candidate_key = entry.get("candidate_key")
+        if not isinstance(candidate_payload, dict) or not isinstance(candidate_key, str):
+            return None
+        try:
+            candidate = naming.MetadataCandidate.from_dict(candidate_payload)
+        except Exception:
+            return None
+        if (
+            candidate.key != candidate_key
+            or candidate.source != "themoviedb"
+            or not candidate.key.startswith("themoviedb:")
+            or not candidate.media_id
+            or not candidate.title
+            or candidate.media_type not in {"tv", "movie", "unknown"}
+            or candidate.key != f"themoviedb:{candidate.media_id}:{candidate.media_type}"
+        ):
+            return None
+        return candidate
+
+    def _review_rows(
+        self,
+        *,
+        include_internal: bool = False,
+        raw_title: Optional[str] = None,
+        directory_context: Optional[Dict[str, Any]] = None,
+        hide_missing_source: bool = False,
+    ) -> List[Dict[str, Any]]:
+        config = self._review_path_config(directory_context)
+        rows = self._get_resolver().preview_rows()
+        labels = {"tv": "电视剧", "movie": "电影", "children": "儿童"}
+        roots = {
+            "tv": config.get("tv_output", ""),
+            "movie": config.get("movie_output", ""),
+            "children": config.get("children_output", ""),
+        }
+        requested_raw_title = raw_title
+        try:
+            manual_payload = self.get_data(self.MANUAL_DECISIONS_KEY)
+        except Exception:
+            manual_payload = {"_load_error": True}
+        output: List[Dict[str, Any]] = []
+        for source in rows:
+            if not isinstance(source, dict):
+                continue
+            raw_value = source.get("raw_title", "")
+            if requested_raw_title is not None and raw_value != requested_raw_title:
+                continue
+            if source.get("completed_at") is not None:
+                continue
+            raw_title_valid, _ = naming.validate_manual_raw_title(raw_value)
+            if not raw_title_valid:
+                self._logger.warning(
+                    "CourseOrganizer[event=review_row_rejected] item_course_repr=%s",
+                    ascii(str(raw_value)),
+                )
+                continue
+            raw_title = raw_value
+            item = {
+                "raw_title": raw_title,
+                "final_title": str(source.get("final_title") or source.get("local_title") or raw_title),
+                "target_library": str(source.get("target_library", "")).lower(),
+                "target_output_root": str(source.get("target_output_root") or ""),
+                "status": str(source.get("status", "")),
+                "reason_codes": list(source.get("reason_codes", ())),
+                "source": str(source.get("source", "")).lower(),
+                "media_id": str(source.get("media_id", "") or ""),
+                "media_type": str(source.get("media_type", "unknown")).lower(),
+                "timestamp": source.get("timestamp"),
+            }
+            source_binding = self._current_source_binding(raw_title)
+            if not source_binding:
+                directory_present = self._review_source_directory_ok(raw_title)
+                if not directory_present and hide_missing_source:
+                    self._logger.debug(
+                        "CourseOrganizer[event=review_row_filtered] item_course_repr=%s reason=source_missing",
+                        ascii(raw_title),
+                    )
+                    continue
+                item["source_pending"] = True
+                self._logger.info(
+                    "CourseOrganizer[event=review_row_pending] item_course_repr=%s reason=source_binding_unavailable",
+                    ascii(raw_title),
+                )
+            else:
+                item.update(source_binding or {})
+            if source_binding and source_binding.get("source_manifest"):
+                media_by_season, _, _ = self._collect_course_files(
+                    source_binding["source_path"]
+                )
+                if not media_by_season:
+                    self._logger.debug(
+                        "CourseOrganizer[event=review_row_filtered] item_course_repr=%s reason=no_media",
+                        ascii(raw_title),
+                    )
+                    continue
+            source_revision = self._review_revision(item)
+            structured = self._manual_decision_for(raw_title, manual_payload)
+            if (
+                source_binding is not None
+                and structured is not None
+                and structured.action in {"confirm", "ignore", "candidate"}
+            ):
+                expected_binding = self._manual_binding(structured)
+                if not self._source_bindings_equal(source_binding, expected_binding):
+                    structured = naming.ManualOverride(raw_title, "invalid")
+            override = structured if structured is not None else self._legacy_review_override(raw_title)
+            if override is not None and override.action == "invalid":
+                item["status"] = "invalid_manual_decision"
+                item["target_library"] = ""
+                item["target_output_root"] = ""
+                item["reason_codes"] = ["invalid_manual_decision"]
+            elif override is not None and override.action == "ignore":
+                item["status"] = "ignore"
+                item["blocked_reason"] = "manual_ignore"
+                item["target_library"] = ""
+                item["target_output_root"] = ""
+            elif override is not None and override.action == "confirm":
+                item["status"] = "local_fallback"
+                item["final_title"] = override.value
+                item["target_library"] = override.target_library
+                candidate = self._manual_candidate_for(raw_title, manual_payload)
+                if candidate is not None:
+                    item["source"] = candidate.source
+                    item["media_id"] = candidate.media_id
+                    item["media_type"] = candidate.media_type
+                elif isinstance(manual_payload, dict):
+                    entry = manual_payload.get("items", {}).get(raw_title, {})
+                    if isinstance(entry, dict):
+                        item["source"] = str(entry.get("media_source", item["source"]))
+                        item["media_id"] = str(entry.get("media_id", item["media_id"]))
+                        item["media_type"] = str(
+                            entry.get("media_type", item["media_type"])
+                        )
+                item["target_output_root"] = os.path.join(
+                    str(roots[override.target_library]), self._safe_name(override.value)
+                )
+                item["reason_codes"] = list(item.get("reason_codes", ())) + [
+                    "manual_confirm"
+                ]
+            elif override is not None and override.action == "candidate":
+                candidate = self._manual_candidate_for(raw_title, manual_payload)
+                if candidate is None:
+                    item["status"] = "invalid_manual_decision"
+                    item["target_library"] = ""
+                    item["target_output_root"] = ""
+                    item["reason_codes"] = ["invalid_manual_decision"]
+                else:
+                    item["source"] = candidate.source
+                    item["media_id"] = candidate.media_id
+                    item["media_type"] = candidate.media_type
+                    entry = (
+                        manual_payload.get("items", {}).get(raw_title, {})
+                        if isinstance(manual_payload, dict)
+                        else {}
+                    )
+                    selected_title = entry.get("final_title") if isinstance(entry, dict) else None
+                    valid_selected_title, _ = naming.validate_manual_name(selected_title)
+                    if not valid_selected_title:
+                        item["status"] = "invalid_manual_decision"
+                        item["target_library"] = ""
+                        item["reason_codes"] = ["invalid_manual_decision"]
+                    else:
+                        item["final_title"] = selected_title
+                    item["target_output_root"] = ""
+                    item["reason_codes"] = list(item.get("reason_codes", ())) + [
+                        "manual_candidate"
+                    ]
+
+            target_library = str(item.get("target_library", "")).lower()
+            if target_library not in labels:
+                target_library = ""
+            final_title = str(
+                item.get("final_title") or item.get("local_title") or raw_title
+            )
+            target_root = str(item.get("target_output_root") or "")
+            if target_library and not target_root:
+                target_root = os.path.join(str(roots[target_library]), self._safe_name(final_title))
+            item.update(
+                {
+                    "raw_title": raw_title,
+                    "final_title": final_title,
+                    "target_library": target_library,
+                    "target_label": labels.get(target_library, "待确认"),
+                    "target_library_label": labels.get(target_library, "待确认"),
+                    "target_output_root": target_root,
+                    "target_position": target_root or "待确认",
+                }
+            )
+            if item.get("source_pending"):
+                item["status_label"] = "源目录待稳定"
+            else:
+                item["status_label"] = self._review_status_label(
+                    str(item.get("status", "")), target_library
+                )
+            media_source = str(item.get("source", "")).strip().lower()
+            media_id = str(item.get("media_id", "") or "").strip()
+            association_required = media_source not in {"themoviedb", "douban"} or not media_id
+            revision = self._review_revision(item)
+            result = {
+                    "raw_title": raw_title,
+                    "revision": revision,
+                    "source_revision": source_revision,
+                    "final_title": final_title,
+                    "target_library": target_library,
+                    "target_label": labels.get(target_library, "待确认"),
+                    "target_library_label": labels.get(target_library, "待确认"),
+                    "target_output_root": target_root,
+                    "target_path": target_root,
+                    "target_position": target_root or "待确认",
+                    "status": str(item.get("status", "")),
+                    "status_label": item["status_label"],
+                    "association_required": association_required,
+                    "recognition_source_label": self._recognition_source_label(
+                        item.get("source", ""),
+                        item.get("reason_codes", ()),
+                        override.action if override is not None else "",
+                    ),
+                }
+            if include_internal:
+                result["_source_binding"] = source_binding
+                result["_media_source"] = media_source
+                result["_media_id"] = media_id
+                result["_media_type"] = str(item.get("media_type", "unknown"))
+            output.append(result)
+        return output
+
+    def get_review(self) -> Any:
+        directory_context = self._moviepilot_directory_context()
+        return self._review_response(
+            True,
+            {
+                "items": self._review_rows(
+                    directory_context=directory_context,
+                    hide_missing_source=True,
+                ),
+                "libraries": directory_context["libraries"],
+                "directory_rules": directory_context["rules"],
+                "rules_ready": directory_context["ready"],
+                "rules_message": directory_context["message"],
+                "monitoring_enabled": directory_context["monitoring_enabled"],
+                "settings_url": directory_context["settings_url"],
+            },
+        )
+
+    def refresh_review(self) -> Any:
+        """Rescan preview data without allowing a refresh to move media."""
+        with self._thread_lock:
+            original_config = getattr(self._run_config_local, "config", _MANUAL_DATA_UNSET)
+            refresh_config = dict(self._get_config())
+            refresh_config["naming_mode"] = "preview"
+            self._run_config_local.config = refresh_config
+            self._resolver = None
+            self._resolver_signature = None
+            try:
+                self._run(force=True)
+            finally:
+                if original_config is _MANUAL_DATA_UNSET:
+                    try:
+                        del self._run_config_local.config
+                    except AttributeError:
+                        pass
+                else:
+                    self._run_config_local.config = original_config
+            return self.get_review()
+
+    def _save_manual_decision(
+        self,
+        raw_title: str,
+        action: str,
+        final_title: str,
+        target_library: str,
+        source_revision: str,
+        source_binding: Dict[str, Any],
+        candidate: Optional[naming.MetadataCandidate] = None,
+        media_source: str = "",
+        media_id: str = "",
+        media_type: str = "unknown",
+    ) -> bool:
+        with self._review_data_lock:
+            if not self._source_binding_matches(raw_title, source_binding):
+                return False
+            try:
+                existing = self.get_data(self.MANUAL_DECISIONS_KEY)
+            except Exception:
+                return False
+            if existing is None:
+                payload: Dict[str, Any] = {
+                    "schema": self.MANUAL_DECISIONS_SCHEMA,
+                    "items": {},
+                }
+            elif (
+                isinstance(existing, dict)
+                and existing.get("schema") == self.MANUAL_DECISIONS_SCHEMA
+                and isinstance(existing.get("items"), dict)
+            ):
+                payload = {"schema": self.MANUAL_DECISIONS_SCHEMA, "items": dict(existing["items"])}
+            else:
+                return False
+            items = payload["items"]
+            if raw_title not in items and len(items) >= self.MANUAL_DECISIONS_MAX:
+                return False
+            try:
+                updated_at = int(self._clock())
+            except (TypeError, ValueError, OverflowError):
+                return False
+            items[raw_title] = {
+                "action": action,
+                "final_title": final_title,
+                "target_library": target_library,
+                "updated_at": updated_at,
+                "source_revision": source_revision,
+                "source_path": source_binding["source_path"],
+                "source_identity": dict(source_binding["source_identity"]),
+                "source_snapshot_digest": source_binding["source_snapshot_digest"],
+                "source_manifest": [
+                    {
+                        "relative_path": item[0],
+                        "st_dev": item[1],
+                        "st_ino": item[2],
+                        "st_ctime_ns": item[3],
+                        "st_size": item[4],
+                        "st_mtime_ns": item[5],
+                    }
+                    for item in source_binding["source_manifest"]
+                ],
+                "source_manifest_digest": source_binding["source_manifest_digest"],
+                "source_directory_manifest": [
+                    {
+                        "relative_path": item[0],
+                        "st_dev": item[1],
+                        "st_ino": item[2],
+                    }
+                    for item in source_binding["source_directory_manifest"]
+                ],
+                "source_directory_manifest_digest": source_binding[
+                    "source_directory_manifest_digest"
+                ],
+            }
+            if action == "candidate" and candidate is None:
+                return False
+            if action in {"candidate", "confirm"} and candidate is not None:
+                if candidate.source != "themoviedb":
+                    return False
+                items[raw_title]["candidate_key"] = candidate.key
+                items[raw_title]["candidate"] = candidate.to_dict()
+            if action == "confirm":
+                media_source = str(media_source or "").strip().lower()
+                media_id = str(media_id or "").strip()
+                media_type = str(media_type or "unknown").strip().lower()
+                if media_source or media_id:
+                    if (
+                        media_source not in {"themoviedb", "douban"}
+                        or not media_id
+                        or media_type not in {"tv", "movie", "unknown"}
+                    ):
+                        return False
+                    items[raw_title]["media_source"] = media_source
+                    items[raw_title]["media_id"] = media_id
+                    items[raw_title]["media_type"] = media_type
+            try:
+                result = self.save_data(self.MANUAL_DECISIONS_KEY, payload)
+            except Exception:
+                self._logger.error(
+                    "CourseOrganizer[event=manual_review_persist_failed] item_course_repr=%s reason=exception",
+                    ascii(raw_title),
+                )
+                return False
+            if result is False:
+                self._logger.error(
+                    "CourseOrganizer[event=manual_review_persist_failed] item_course_repr=%s reason=save_data_false",
+                    ascii(raw_title),
+                )
+                return False
+            if not self._source_binding_matches(raw_title, source_binding):
+                try:
+                    self.save_data(self.MANUAL_DECISIONS_KEY, existing)
+                except Exception:
+                    self._logger.error(
+                        "CourseOrganizer[event=manual_review_persist_failed] item_course_repr=%s reason=rollback_exception",
+                        ascii(raw_title),
+                    )
+                return False
+            return True
+
+    def save_review(self, payload: Optional[Dict[str, Any]] = Body(default=None)) -> Any:
+        if not isinstance(payload, dict):
+            return self._review_response(False, message="请求参数无效")
+        raw_title = payload.get("raw_title")
+        raw_title_valid, _ = naming.validate_manual_raw_title(raw_title)
+        if not raw_title_valid:
+            return self._review_response(False, message="课程名称无效")
+        revision = payload.get("revision")
+        if not isinstance(revision, str) or not revision:
+            return self._review_response(False, message="缺少预览版本")
+        action = str(payload.get("action", "")).strip().lower()
+        if action not in {"confirm", "ignore"}:
+            return self._review_response(False, message="操作无效")
+
+        with self._thread_lock:
+            rows = self._review_rows(include_internal=True, raw_title=raw_title)
+            current = next((item for item in rows if item.get("raw_title") == raw_title), None)
+            if current is None:
+                return self._review_response(False, message="预览记录不存在或已失效")
+            if revision != current.get("revision"):
+                return self._review_response(False, message="预览已更新，请刷新后再确认")
+            expected_binding = current.get("_source_binding")
+            if not isinstance(expected_binding, dict):
+                return self._review_response(False, message="源目录已不存在或已变化，请刷新预览")
+
+            final_title = payload.get("final_title", "")
+            target_library = str(payload.get("target_library", "")).strip().lower()
+            linked_candidate: Optional[naming.MetadataCandidate] = None
+            media_source = ""
+            media_id = ""
+            media_type = "unknown"
+            if action == "confirm":
+                valid_name, _ = naming.validate_manual_name(final_title)
+                if not valid_name:
+                    return self._review_response(False, message="建议名称无效")
+                if target_library not in naming.MANUAL_TARGET_LIBRARIES:
+                    return self._review_response(False, message="目标媒体库无效")
+                directory_context = self._moviepilot_directory_context()
+                selected_rule = directory_context.get("selected", {}).get(target_library)
+                if not isinstance(selected_rule, dict):
+                    return self._review_response(
+                        False,
+                        message="MoviePilot 目标目录规则缺失或不唯一，请到设置 → 存储 & 目录修正",
+                    )
+                if not selected_rule.get("renaming"):
+                    return self._review_response(
+                        False,
+                        message="请先在 MoviePilot 设置 → 存储 & 目录为该规则开启智能重命名",
+                    )
+                linked_candidate = self._manual_candidate_for(raw_title)
+                if linked_candidate is not None:
+                    media_source = linked_candidate.source
+                    media_id = linked_candidate.media_id
+                    media_type = linked_candidate.media_type
+                else:
+                    media_source = str(current.get("_media_source", "")).strip().lower()
+                    media_id = str(current.get("_media_id", "")).strip()
+                    media_type = str(current.get("_media_type", "unknown")).strip().lower()
+                if media_source not in {"themoviedb", "douban"} or not media_id:
+                    return self._review_response(
+                        False,
+                        message="请先按名称搜索并关联 TMDB，再确认整理",
+                    )
+            else:
+                final_title = ""
+                target_library = ""
+
+            if not self._save_manual_decision(
+                raw_title,
+                action,
+                final_title,
+                target_library,
+                str(current.get("source_revision", "")),
+                expected_binding,
+                candidate=linked_candidate,
+                media_source=media_source,
+                media_id=media_id,
+                media_type=media_type,
+            ):
+                return self._review_response(False, message="保存人工决定失败")
+            self._logger.info(
+                "CourseOrganizer[event=manual_review_saved] item_course_repr=%s item_action=%s item_library=%s",
+                ascii(raw_title),
+                action,
+                target_library,
+            )
+            if action == "confirm":
+                apply_status = self._apply_manual_decision_locked(
+                    raw_title,
+                    expected_binding["source_path"],
+                    expected_binding,
+                )
+                if apply_status == "no_media":
+                    self._resolver = None
+                    self._resolver_signature = ()
+                    return self._review_response(
+                        False,
+                        message="源目录中没有可整理的视频文件，可能已经整理过，请刷新列表",
+                    )
+                if apply_status == "failed":
+                    self._resolver = None
+                    self._resolver_signature = ()
+                    return self._review_response(
+                        False,
+                        message="人工决定已保存，但单条整理失败，请检查源目录和目标媒体库后重试",
+                    )
+                if apply_status == "partial":
+                    self._resolver = None
+                    self._resolver_signature = ()
+                    return self._review_response(
+                        False,
+                        {
+                            "moved": True,
+                            "record_incomplete": True,
+                        },
+                        "文件已移动，但人工复核记录未完整保存，请勿重复确认；请检查记录后处理",
+                    )
+                self._logger.info(
+                    "CourseOrganizer[event=manual_review_applied] item_course_repr=%s item_library=%s",
+                    ascii(raw_title),
+                    target_library,
+                )
+            self._resolver = None
+            self._resolver_signature = ()
+            latest = next(
+                (
+                    item
+                    for item in self._review_rows(raw_title=raw_title)
+                    if item.get("raw_title") == raw_title
+                ),
+                None,
+            )
+            return self._review_response(
+                True,
+                latest or {},
+                "已确认并整理" if action == "confirm" else "已保存",
+            )
+
+    def _legacy_apply_manual_decision_locked(
+        self,
+        course_name: str,
+        course_path: str,
+        expected_binding: Dict[str, Any],
+    ) -> str:
+        """Apply one saved confirmation through the existing locked move chain."""
+        if not isinstance(course_path, str) or not os.path.isabs(course_path):
+            return "failed"
+        current_binding = self._current_source_binding(course_name)
+        if not self._source_bindings_equal(current_binding, expected_binding):
+            self._logger.warning(
+                "CourseOrganizer[event=manual_review_apply_rejected] item_course_repr=%s reason=source_changed",
+                ascii(course_name),
+            )
+            return "failed"
+
+        signature = self._coerce_signature(self._snapshot_signature(course_path))
+        if not signature:
+            self._logger.warning(
+                "CourseOrganizer[event=manual_review_apply_rejected] item_course_repr=%s reason=empty_snapshot",
+                ascii(course_name),
+            )
+            return "failed"
+        state_key = self._state_key(course_name)
+        state = self._load_plugin_data(state_key, {})
+        persisted_signature = (
+            self._coerce_signature(state.get("signature"))
+            if isinstance(state, dict)
+            else ()
+        )
+        try:
+            stable_count = int(state.get("stable_count", 0)) if isinstance(state, dict) else 0
+        except (TypeError, ValueError, OverflowError):
+            stable_count = 0
+        if persisted_signature != signature or stable_count < 1:
+            if self.save_data(state_key, {"signature": signature, "stable_count": 1}) is False:
+                self._logger.error(
+                    "CourseOrganizer[event=manual_review_apply_rejected] item_course_repr=%s reason=state_persist_failed",
+                    ascii(course_name),
+                )
+                return "failed"
+
+        original_config = getattr(self._run_config_local, "config", _MANUAL_DATA_UNSET)
+        apply_config = dict(self._get_config())
+        apply_config["naming_mode"] = "apply"
+        apply_result: Dict[str, Any] = {
+            "moved": False,
+            "decision_consumed": False,
+        }
+        self._run_config_local.config = apply_config
+        try:
+            try:
+                moved = self._process_course_locked(
+                    course_name,
+                    course_path,
+                    source_root=apply_config.get("incoming"),
+                    apply_result=apply_result,
+                )
+            except Exception as exc:
+                self._logger.error(
+                    "CourseOrganizer[event=manual_review_apply_failed] item_course_repr=%s reason=%s",
+                    ascii(course_name),
+                    exc.__class__.__name__,
+                )
+                moved = False
+        finally:
+            if original_config is _MANUAL_DATA_UNSET:
+                try:
+                    del self._run_config_local.config
+                except AttributeError:
+                    pass
+            else:
+                self._run_config_local.config = original_config
+        if not moved or not apply_result.get("moved"):
+            return "failed"
+        if not apply_result.get("decision_consumed"):
+            self._logger.error(
+                "CourseOrganizer[event=moved_but_record_incomplete] item_course_repr=%s phase=manual_decision",
+                ascii(course_name),
+            )
+            return "partial"
+        resolver = self._get_resolver()
+        try:
+            completed = resolver.mark_completed(course_name)
+        except Exception:
+            completed = False
+        if not completed:
+            self._logger.error(
+                "CourseOrganizer[event=moved_but_record_incomplete] item_course_repr=%s phase=completed_at",
+                ascii(course_name),
+            )
+            return "partial"
+        return "success"
+
+    def _confirmed_media_identity(
+        self, course_name: str
+    ) -> Optional[Tuple[str, str, str]]:
+        try:
+            payload = self.get_data(self.MANUAL_DECISIONS_KEY)
+        except Exception:
+            return None
+        candidate = self._manual_candidate_for(course_name, payload)
+        if candidate is not None:
+            return candidate.source, candidate.media_id, candidate.media_type
+        items = payload.get("items") if isinstance(payload, dict) else None
+        entry = items.get(course_name) if isinstance(items, dict) else None
+        if not isinstance(entry, dict) or entry.get("action") != "confirm":
+            return None
+        media_source = str(entry.get("media_source", "")).strip().lower()
+        media_id = str(entry.get("media_id", "")).strip()
+        media_type = str(entry.get("media_type", "unknown")).strip().lower()
+        if (
+            media_source not in {"themoviedb", "douban"}
+            or not media_id
+            or media_type not in {"tv", "movie", "unknown"}
+        ):
+            return None
+        return media_source, media_id, media_type
+
+    def _apply_manual_decision_locked(
+        self,
+        course_name: str,
+        course_path: str,
+        expected_binding: Dict[str, Any],
+    ) -> str:
+        """Apply one confirmed item through MoviePilot's native manual transfer."""
+        if not isinstance(course_path, str) or not os.path.isabs(course_path):
+            return "failed"
+        current_binding = self._current_source_binding(course_name)
+        if not self._source_bindings_equal(current_binding, expected_binding):
+            self._logger.warning(
+                "CourseOrganizer[event=native_transfer_rejected] item_course_repr=%s reason=source_changed",
+                ascii(course_name),
+            )
+            return "failed"
+
+        decision = self._manual_decision_for(course_name)
+        if decision is None or decision.action != "confirm":
+            return "failed"
+        if self._manual_binding(decision) != expected_binding:
+            return "failed"
+        identity = self._confirmed_media_identity(course_name)
+        if identity is None:
+            self._logger.warning(
+                "CourseOrganizer[event=native_transfer_rejected] item_course_repr=%s reason=missing_media_identity",
+                ascii(course_name),
+            )
+            return "failed"
+        media_source, media_id, _recognized_media_type = identity
+
+        directory_context = self._moviepilot_directory_context()
+        rule = directory_context.get("selected", {}).get(decision.target_library)
+        if not isinstance(rule, dict):
+            self._logger.warning(
+                "CourseOrganizer[event=native_transfer_rejected] item_course_repr=%s reason=directory_rule_missing",
+                ascii(course_name),
+            )
+            return "failed"
+        if not rule.get("renaming"):
+            self._logger.warning(
+                "CourseOrganizer[event=native_transfer_rejected] item_course_repr=%s reason=renaming_disabled",
+                ascii(course_name),
+            )
+            return "failed"
+
+        adapter = self._get_native_adapter()
+        if adapter is None:
+            self._logger.error(
+                "CourseOrganizer[event=native_transfer_failed] item_course_repr=%s reason=adapter_unavailable",
+                ascii(course_name),
+            )
+            return "failed"
+        try:
+            fileitem = adapter.get_file_item(
+                course_path,
+                source_storage=str(rule.get("storage") or "local"),
+            )
+        except Exception as exc:
+            self._logger.error(
+                "CourseOrganizer[event=native_transfer_failed] item_course_repr=%s phase=file_item reason=%s",
+                ascii(course_name),
+                exc.__class__.__name__,
+            )
+            return "failed"
+        if fileitem is None:
+            return "failed"
+
+        tmdbid: Optional[int] = None
+        doubanid: Optional[str] = None
+        if media_source == "themoviedb":
+            if not media_id.isdigit() or int(media_id) <= 0:
+                return "failed"
+            tmdbid = int(media_id)
+        else:
+            doubanid = media_id
+        media_type = "movie" if decision.target_library == "movie" else "tv"
+        try:
+            with adapter.rename_context(course_path, decision.value):
+                result = adapter.manual_transfer(
+                    fileitem=fileitem,
+                    target_storage=str(rule.get("library_storage") or "local"),
+                    target_path=Path(str(rule["path"])),
+                    tmdbid=tmdbid,
+                    doubanid=doubanid,
+                    media_source=media_source,
+                    media_id=media_id,
+                    mtype=media_type,
+                    transfer_type=str(rule.get("transfer_type") or "") or None,
+                    scrape=bool(rule.get("scraping")),
+                    library_type_folder=bool(rule.get("library_type_folder")),
+                    library_category_folder=bool(
+                        rule.get("library_category_folder")
+                    ),
+                    force=False,
+                    background=False,
+                    preview=False,
+                    sync_extra_files=True,
+                )
+        except Exception as exc:
+            self._logger.error(
+                "CourseOrganizer[event=native_transfer_failed] item_course_repr=%s phase=transfer reason=%s",
+                ascii(course_name),
+                exc.__class__.__name__,
+            )
+            return "failed"
+        if not isinstance(result, tuple) or len(result) != 2:
+            self._logger.warning(
+                "CourseOrganizer[event=native_transfer_failed] item_course_repr=%s phase=result",
+                ascii(course_name),
+            )
+            return "failed"
+        if result[0] is not True:
+            if result[0] is False and isinstance(result[1], str) and "没有找到可整理的媒体文件" in result[1]:
+                self._logger.warning(
+                    "CourseOrganizer[event=native_transfer_failed] item_course_repr=%s phase=result reason=no_media",
+                    ascii(course_name),
+                )
+                return "no_media"
+            self._logger.warning(
+                "CourseOrganizer[event=native_transfer_failed] item_course_repr=%s phase=result reason=transfer_failed",
+                ascii(course_name),
+            )
+            return "failed"
+
+        if not self._consume_manual_decision(course_name, expected_binding):
+            self._logger.error(
+                "CourseOrganizer[event=moved_but_record_incomplete] item_course_repr=%s phase=manual_decision",
+                ascii(course_name),
+            )
+            return "partial"
+        try:
+            completed = self._get_resolver().mark_completed(course_name)
+        except Exception:
+            completed = False
+        if not completed:
+            self._logger.error(
+                "CourseOrganizer[event=moved_but_record_incomplete] item_course_repr=%s phase=completed_at",
+                ascii(course_name),
+            )
+            return "partial"
+        return "success"
+
+    @staticmethod
+    def _tmdb_candidate_response(candidate: naming.MetadataCandidate) -> Dict[str, Any]:
+        media_type = candidate.media_type if candidate.media_type in {"tv", "movie"} else "unknown"
+        media_label = {"tv": "电视剧", "movie": "电影"}.get(media_type, "未知类型")
+        return {
+            "candidate_key": candidate.key,
+            "title": candidate.title,
+            "year": candidate.year,
+            "media_type": media_type,
+            "label": media_label,
+        }
+
+    def _review_row_for_request(
+        self, payload: Optional[Dict[str, Any]]
+    ) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]], str]:
+        if not isinstance(payload, dict):
+            return None, None, None, "请求参数无效"
+        raw_title = payload.get("raw_title")
+        raw_title_valid, _ = naming.validate_manual_raw_title(raw_title)
+        if not raw_title_valid:
+            return None, None, None, "课程名称无效"
+        revision = payload.get("revision")
+        if not isinstance(revision, str) or not revision:
+            return None, None, None, "缺少预览版本"
+        rows = self._review_rows(include_internal=True, raw_title=raw_title)
+        current = next((item for item in rows if item.get("raw_title") == raw_title), None)
+        if current is None:
+            return raw_title, revision, None, "预览记录不存在或已失效"
+        if revision != current.get("revision"):
+            return raw_title, revision, None, "预览已更新，请刷新后再操作"
+        binding = current.get("_source_binding")
+        if not isinstance(binding, dict):
+            return raw_title, revision, None, "源目录已不存在或已变化，请刷新预览"
+        return raw_title, revision, current, ""
+
+    def search_tmdb(self, payload: Optional[Dict[str, Any]] = Body(default=None)) -> Any:
+        # Read-only search: never holds the move lock, so other rows keep working
+        # while a single confirmation is moving files.
+        raw_title, _revision, current, message = self._review_row_for_request(payload)
+        if message:
+            return self._review_response(False, message=message)
+        config = self._get_config()
+        if config.get("naming_mode") == "off":
+            return self._review_response(False, message="请先启用命名预览后再搜索 TMDB")
+        result = self._get_resolver().search_tmdb_candidates(
+            str(raw_title), NamingConfig.sanitize(config), limit=10
+        )
+        candidates = [
+            candidate
+            for candidate in result.candidates[:10]
+            if candidate.source == "themoviedb"
+        ]
+        if not candidates:
+            if result.all_failed or result.errors:
+                return self._review_response(
+                    False,
+                    message="TMDB 连接失败，请检查 MoviePilot 网络或 TMDB API 服务地址",
+                )
+            return self._review_response(
+                False,
+                message="未找到 TMDB 候选，请检查名称或 TMDB 数据源配置",
+            )
+        return self._review_response(
+            True,
+            {
+                "raw_title": raw_title,
+                "revision": current.get("revision"),
+                "items": [self._tmdb_candidate_response(candidate) for candidate in candidates],
+            },
+            "已按目录名称找到 TMDB 候选",
+        )
+
+    def associate_tmdb(self, payload: Optional[Dict[str, Any]] = Body(default=None)) -> Any:
+        # The store write is protected by _review_data_lock inside _save_manual_decision;
+        # the move lock is intentionally not taken here.
+        raw_title, _revision, current, message = self._review_row_for_request(payload)
+        if message:
+            return self._review_response(False, message=message)
+        candidate_key = payload.get("candidate_key") if isinstance(payload, dict) else None
+        if (
+            not isinstance(candidate_key, str)
+            or not candidate_key
+            or len(candidate_key) > 255
+            or any(ord(char) < 0x20 or ord(char) in {0x7F, 0x85} for char in candidate_key)
+        ):
+            return self._review_response(False, message="TMDB 候选无效")
+        config = self._get_config()
+        if config.get("naming_mode") == "off":
+            return self._review_response(False, message="请先启用命名预览后再关联 TMDB")
+        result = self._get_resolver().search_tmdb_candidates(
+            str(raw_title), NamingConfig.sanitize(config), limit=10
+        )
+        candidate = next(
+            (
+                item
+                for item in result.candidates[:10]
+                if item.key == candidate_key and item.source == "themoviedb"
+            ),
+            None,
+        )
+        if candidate is None:
+            if result.all_failed or result.errors:
+                return self._review_response(
+                    False,
+                    message="TMDB 连接失败，请检查 MoviePilot 网络或 TMDB API 服务地址",
+                )
+            return self._review_response(False, message="TMDB 候选已失效，请重新搜索")
+        binding = current.get("_source_binding") if isinstance(current, dict) else None
+        if not isinstance(binding, dict):
+            return self._review_response(False, message="源目录已不存在或已变化，请刷新预览")
+        target_library = str(current.get("target_library", "")).lower()
+        if target_library not in naming.MANUAL_TARGET_LIBRARIES:
+            target_library = ""
+        final_title = naming.format_selected_candidate_name(
+            candidate,
+            append_tmdb_id=bool(config.get("naming_append_tmdb_id", False)),
+        )
+        if not self._save_manual_decision(
+            str(raw_title),
+            "candidate",
+            final_title,
+            target_library,
+            str(current.get("source_revision", "")),
+            binding,
+            candidate=candidate,
+        ):
+            return self._review_response(False, message="保存 TMDB 关联失败")
+        self._logger.info(
+            "CourseOrganizer[event=manual_tmdb_associated] item_course_repr=%s",
+            ascii(str(raw_title)),
+        )
+        self._resolver = None
+        self._resolver_signature = ()
+        latest = next(
+            (
+                item
+                for item in self._review_rows(raw_title=str(raw_title))
+                if item.get("raw_title") == raw_title
+            ),
+            None,
+        )
+        return self._review_response(True, latest or {}, "已保存 TMDB 关联")
 
     def get_page(self) -> List[Dict[str, Any]]:
         config = self._get_config()
         naming_mode = str(config["naming_mode"])
         rows: List[Dict[str, Any]] = []
         if naming_mode != "off":
-            rows = self._get_resolver().preview_rows()
+            rows = self._review_rows()
 
         target_labels = {"tv": "电视剧", "movie": "电影", "children": "儿童"}
         display_rows: List[Dict[str, Any]] = []
@@ -454,316 +2589,117 @@ class CourseOrganizer(_PluginBase):
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         config = self._get_config()
         defaults = dict(config)
-        # FormRender-only state; configuration normalization ignores it.
-        defaults["_active_config_tab"] = "directories"
-
-        field_props = {
-            "density": "comfortable",
-            "variant": "outlined",
-            "hide-details": True,
-        }
-
-        def text_field(model: str, label: str, **extra: Any) -> Dict[str, Any]:
-            props = dict(field_props)
-            props.update({"model": model, "label": label, "aria-label": label})
-            props.update(extra)
-            return {"component": "VTextField", "props": props}
-
-        def switch(model: str, label: str, **extra: Any) -> Dict[str, Any]:
-            props = {
-                "model": model,
-                "label": label,
-                "aria-label": label,
-                "color": "primary",
-                "density": "comfortable",
-                "hide-details": True,
-                "inset": True,
-            }
-            props.update(extra)
-            return {"component": "VSwitch", "props": props}
-
-        def select(model: str, label: str, items: List[Dict[str, str]]) -> Dict[str, Any]:
-            props = dict(field_props)
-            props.update({"model": model, "label": label, "aria-label": label, "items": items})
-            return {"component": "VSelect", "props": props}
-
-        def step_item(
-            title: str,
-            subtitle: str,
-            tab: str,
-            content: List[Dict[str, Any]],
-        ) -> Dict[str, Any]:
-            return {
-                "component": "VWindowItem",
-                "props": {"value": tab, "class": "pt-1"},
-                "content": [
-                    {
-                        "component": "VCard",
-                        "props": {
-                            "title": title,
-                            "subtitle": subtitle,
-                            "variant": "outlined",
-                            "class": "pa-3",
-                        },
-                        "content": content,
-                    }
-                ],
-            }
-
-        directory_content = [
+        advanced = [
             {
-                "component": "VAlert",
+                "component": "VTextField",
                 "props": {
-                    "type": "info",
-                    "variant": "tonal",
+                    "model": "naming_sources",
+                    "label": "识别来源（逗号分隔）",
+                    "aria-label": "识别来源（逗号分隔）",
                     "density": "comfortable",
-                    "class": "mb-3",
+                    "variant": "outlined",
                 },
-                "text": "先确认四个目录均已正确挂载；下一步安全预览只记录建议，不移动文件。",
             },
-            text_field("incoming", "待整理目录"),
-            text_field("tv_output", "电视剧目录"),
-            text_field("movie_output", "电影目录"),
-            text_field("children_output", "儿童目录"),
-        ]
-
-        preview_content = [
             {
-                "component": "VAlert",
+                "component": "VTextField",
                 "props": {
-                    "type": "info",
-                    "variant": "tonal",
+                    "model": "naming_auto_threshold",
+                    "label": "自动采用阈值（80~100）",
+                    "aria-label": "自动采用阈值（80~100）",
+                    "type": "number",
+                    "min": 80,
+                    "max": 100,
                     "density": "comfortable",
-                    "class": "mb-3",
+                    "variant": "outlined",
                 },
-                "text": "安全预览只记录建议，不移动文件。关闭命名仍会整理；先核对原始名称、建议名称和目标位置。",
             },
-            select(
-                "naming_mode",
-                "命名模式",
-                [
-                    {"title": "关闭命名（仍会整理）", "value": "off"},
-                    {"title": "预览模式", "value": "preview"},
-                    {"title": "应用模式", "value": "apply"},
-                ],
-            ),
-        ]
-
-        exception_content = [
             {
-                "component": "VAlert",
+                "component": "VTextField",
                 "props": {
-                    "type": "warning",
-                    "variant": "tonal",
+                    "model": "naming_min_margin",
+                    "label": "领先幅度（5~30）",
+                    "aria-label": "领先幅度（5~30）",
+                    "type": "number",
+                    "min": 5,
+                    "max": 30,
                     "density": "comfortable",
-                    "class": "mb-3",
+                    "variant": "outlined",
                 },
-                "text": "下载未完成、分类低置信度或需要人工判断时，会暂停整理并保留原目录。",
-            }
-        ]
-
-        advanced_content = [
-            text_field("interval", "扫描间隔（秒）", type="number", min=30),
-            text_field("naming_sources", "命名数据源（逗号分隔）"),
-            text_field("naming_auto_threshold", "自动采用阈值（80~100）", type="number", min=80, max=100),
-            text_field("naming_min_margin", "领先幅度（5~30）", type="number", min=5, max=30),
-            select(
-                "naming_uncertain_policy",
-                "低置信度策略",
-                [
-                    {"title": "仅预览，不自动采用", "value": "local"},
-                    {"title": "阻止整理并等待确认", "value": "hold"},
-                ],
-            ),
-            switch("naming_append_tmdb_id", "追加 TMDB ID 到目录"),
-            switch(
-                "naming_ai_review",
-                "启用 AI 复核（受 MoviePilot 全局 AI 配置影响）",
-            ),
+            },
             {
-                "component": "VTextarea",
+                "component": "VSwitch",
                 "props": {
-                    "model": "naming_manual_overrides",
-                    "label": "人工覆盖",
-                    "aria-label": "人工覆盖",
-                    "rows": 4,
-                    **field_props,
+                    "model": "naming_append_tmdb_id",
+                    "label": "名称追加 TMDB ID",
+                    "aria-label": "名称追加 TMDB ID",
+                    "color": "primary",
                 },
             },
-            switch(
-                "naming_clear_cache_once",
-                "一次性清空命名缓存",
-                color="error",
-            ),
-        ]
-
-        automatic_content = [
             {
-                "component": "VAlert",
+                "component": "VSwitch",
                 "props": {
-                    "type": "info",
-                    "variant": "tonal",
-                    "density": "comfortable",
-                    "class": "mb-3",
+                    "model": "naming_ai_review",
+                    "label": "启用 AI 辅助复核",
+                    "aria-label": "启用 AI 辅助复核",
+                    "color": "primary",
                 },
-                "text": "确认安全预览结果后，再开启自动整理；保存语义保持不变。",
             },
-            switch("enabled", "开启自动整理"),
-            switch("run_once", "保存后扫描一次"),
+            {
+                "component": "VSwitch",
+                "props": {
+                    "model": "naming_clear_cache_once",
+                    "label": "一次性清空识别缓存",
+                    "aria-label": "一次性清空识别缓存",
+                    "color": "error",
+                },
+            },
         ]
-
-        advanced_panels = {
-            "component": "VExpansionPanels",
-            "props": {
-                "variant": "accordion",
-                "class": "course-advanced-panels",
-                "aria-label": "高级设置",
-            },
-            "content": [
-                {
-                    "component": "VExpansionPanel",
-                    "props": {
-                        "title": "高级设置",
-                        "value": "advanced",
-                        "aria-label": "高级设置",
-                    },
-                    "content": [
-                        {
-                            "component": "VExpansionPanelText",
-                            "content": advanced_content,
-                        }
-                    ],
-                }
-            ],
-        }
-        exception_content.append(advanced_panels)
-
-        tab_items = [
-            ("directories", "选择目录"),
-            ("preview", "安全预览"),
-            ("exceptions", "处理异常"),
-            ("automatic", "开启自动整理"),
-        ]
-
-        def tabs(class_name: str, **props: Any) -> Dict[str, Any]:
-            tab_props = {
-                "model": "_active_config_tab",
-                "color": "primary",
-                "density": "comfortable",
-                "class": class_name,
-                "aria-label": "课程整理步骤",
-            }
-            tab_props.update(props)
-            return {
-                "component": "VTabs",
-                "props": tab_props,
-                "content": [
-                    {
-                        "component": "VTab",
-                        "props": {
-                            "value": value,
-                            "aria-label": label,
-                            "min-height": 48,
-                            "height": 48,
-                        },
-                        "text": label,
-                    }
-                    for value, label in tab_items
-                ],
-            }
-
-        desktop_tabs = tabs(
-            "course-step-tabs d-none d-md-flex",
-            **{"direction": "vertical", "align-tabs": "start", "grow": False},
-        )
-        mobile_tabs = tabs(
-            "course-step-tabs-mobile d-flex d-md-none overflow-x-auto mb-2",
-            **{"show-arrows": True, "grow": False},
-        )
-        step_window = {
-            "component": "VWindow",
-            "props": {
-                "model": "_active_config_tab",
-                "class": "course-step-window",
-                "aria-label": "课程整理步骤内容",
-            },
-            "content": [
-                step_item(
-                    "选择目录",
-                    "先确认 incoming、电视剧、电影和儿童目录",
-                    "directories",
-                    directory_content,
-                ),
-                step_item(
-                    "安全预览",
-                    "只记录建议，不移动文件",
-                    "preview",
-                    preview_content,
-                ),
-                step_item(
-                    "处理异常",
-                    "低置信度和未完成下载会暂停整理",
-                    "exceptions",
-                    exception_content,
-                ),
-                step_item(
-                    "开启自动整理",
-                    "确认预览结果后再保存并开启",
-                    "automatic",
-                    automatic_content,
-                ),
-            ],
-        }
-
         return [
             {
                 "component": "VForm",
                 "props": {
-                    "label-position": "left",
-                    "hide-required-asterisk": True,
-                    "class": "courseorganizer-form overflow-x-hidden",
-                    "aria-label": "课程整理设置",
+                    "class": "courseorganizer-form",
+                    "aria-label": "课程识别设置",
                 },
                 "content": [
                     {
-                        "component": "VSheet",
+                        "component": "VAlert",
                         "props": {
-                            "class": "d-flex flex-wrap align-center ga-2 px-3 py-2 mb-2 border",
-                            "color": "transparent",
-                            "rounded": "lg",
+                            "type": "info",
+                            "variant": "tonal",
+                            "class": "mb-3",
                         },
-                        "content": [
-                            {
-                                "component": "VChip",
-                                "props": {
-                                    "color": "success" if config["enabled"] else "default",
-                                    "size": "small",
-                                    "variant": "tonal",
-                                    "aria-label": "自动整理已开启" if config["enabled"] else "自动整理已关闭",
-                                },
-                                "text": "自动整理已开启" if config["enabled"] else "自动整理已关闭",
-                            },
-                            {
-                                "component": "VCardText",
-                                "props": {"class": "pa-0 text-caption text-medium-emphasis"},
-                                "text": "先选目录，再安全预览，最后决定是否自动整理。",
-                            },
-                        ],
+                        "text": (
+                            "来源目录、目标媒体库、搬运方式、重命名、刮削和通知统一使用 "
+                            "MoviePilot 设置 → 存储 & 目录；本插件不重复保存这些配置。"
+                        ),
                     },
                     {
-                        "component": "VRow",
-                        "props": {"class": "course-step-layout", "align": "start", "no-gutters": True},
+                        "component": "VBtn",
+                        "props": {
+                            "href": "#/setting",
+                            "prepend-icon": "mdi-folder-cog",
+                            "variant": "tonal",
+                            "color": "primary",
+                            "class": "mb-3",
+                            "aria-label": "打开 MoviePilot 存储与目录设置",
+                        },
+                        "text": "打开 MoviePilot 存储与目录设置",
+                    },
+                    {
+                        "component": "VExpansionPanels",
+                        "props": {"variant": "accordion"},
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3, "class": "pe-md-4"},
-                                "content": [desktop_tabs],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 9, "class": "min-w-0"},
-                                "content": [mobile_tabs, step_window],
-                            },
+                                "component": "VExpansionPanel",
+                                "props": {"title": "高级识别设置", "value": "recognition"},
+                                "content": [
+                                    {
+                                        "component": "VExpansionPanelText",
+                                        "content": advanced,
+                                    }
+                                ],
+                            }
                         ],
                     },
                 ],
@@ -892,6 +2828,13 @@ class CourseOrganizer(_PluginBase):
             course_dir = os.path.join(incoming, entry)
             if not os.path.isdir(course_dir):
                 continue
+            valid_title, _ = naming.validate_manual_raw_title(entry)
+            if not valid_title:
+                self._logger.warning(
+                    "CourseOrganizer[event=scan_entry_rejected] item_course_repr=%s",
+                    self._safe_log_value(entry),
+                )
+                continue
             processed += 1
             try:
                 if self._process_course(entry, course_dir, source_root=incoming_path):
@@ -901,13 +2844,13 @@ class CourseOrganizer(_PluginBase):
                 item_error = "exception"
                 self._logger.info(
                     "CourseOrganizer[event=item_error] item_course=%s item_reason=%s item_error=%s",
-                    entry,
+                    self._safe_log_value(entry),
                     item_reason,
                     item_error,
                 )
                 self._logger.error(
                     "CourseOrganizer[event=item_error] item_course=%s item_reason=%s item_error=%s",
-                    entry,
+                    self._safe_log_value(entry),
                     item_reason,
                     item_error,
                 )
@@ -977,6 +2920,7 @@ class CourseOrganizer(_PluginBase):
         directory_hints: naming.DirectoryHints,
         legacy_output_root: str,
         target_output_root: str,
+        manual_decision: Optional[naming.ManualOverride] = None,
     ) -> NamingDecision:
         config = NamingConfig.sanitize(self._get_config())
         if config.mode == "off":
@@ -989,6 +2933,7 @@ class CourseOrganizer(_PluginBase):
             config,
             legacy_output_root=legacy_output_root,
             target_output_root=target_output_root,
+            manual_decision=manual_decision,
         )
         return decision
 
@@ -1024,6 +2969,7 @@ class CourseOrganizer(_PluginBase):
             blocked_reason=blocked_reason,
             legacy_output_root=source.legacy_output_root,
             target_output_root=source.target_output_root,
+            target_library=source.target_library,
         )
 
     def _get_resolver(self) -> SmartNamingResolver:
@@ -1135,12 +3081,36 @@ class CourseOrganizer(_PluginBase):
         output_root: Optional[str] = None,
         source_root: Optional[str] = None,
     ) -> bool:
+        with self._thread_lock:
+            return self._process_course_locked(
+                course_name,
+                course_path,
+                output_root=output_root,
+                source_root=source_root,
+            )
+
+    def _process_course_locked(
+        self,
+        course_name: str,
+        course_path: str,
+        output_root: Optional[str] = None,
+        source_root: Optional[str] = None,
+        apply_result: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        valid_title, _ = naming.validate_manual_raw_title(course_name)
+        if not valid_title:
+            self._logger.warning(
+                "CourseOrganizer[event=scan_entry_rejected] item_course_repr=%s",
+                ascii(course_name),
+            )
+            return False
+        course_log = self._safe_log_value(course_name)
         state_key = self._state_key(course_name)
         if source_root is not None and not self._is_within_realpath(source_root, course_path):
             self.save_data(state_key, None)
             self._logger.error(
                 "CourseOrganizer[event=source_path_escape] item_course=%s",
-                course_name,
+                course_log,
             )
             return False
         signature = self._coerce_signature(self._snapshot_signature(course_path))
@@ -1158,11 +3128,11 @@ class CourseOrganizer(_PluginBase):
             )
             self._logger.info(
                 "CourseOrganizer[event=item_deferred] item_course=%s item_reason=initial_incomplete",
-                course_name,
+                course_log,
             )
             self._logger.debug(
                 "CourseOrganizer[event=incomplete_blocked] item_phase=initial item_course=%s",
-                course_name,
+                course_log,
             )
             return False
 
@@ -1171,7 +3141,7 @@ class CourseOrganizer(_PluginBase):
             self._logger.debug(
                 "CourseOrganizer[event=item_deferred] item_course=%s "
                 "item_reason=first_snapshot item_stable_count=1",
-                course_name,
+                course_log,
             )
             return False
 
@@ -1180,7 +3150,7 @@ class CourseOrganizer(_PluginBase):
             self._logger.debug(
                 "CourseOrganizer[event=item_deferred] item_course=%s "
                 "item_reason=changed_before_stabilization item_stable_count=1",
-                course_name,
+                course_log,
             )
             return False
 
@@ -1191,7 +3161,7 @@ class CourseOrganizer(_PluginBase):
             self._logger.debug(
                 "CourseOrganizer[event=item_deferred] item_course=%s "
                 "item_reason=stable_count_pending item_stable_count=%d",
-                course_name,
+                course_log,
                 next_stable_count,
             )
             return False
@@ -1202,21 +3172,21 @@ class CourseOrganizer(_PluginBase):
             self._logger.debug(
                 "CourseOrganizer[event=item_deferred] item_course=%s "
                 "item_reason=changed_before_final_confirmation item_stable_count=1",
-                course_name,
+                course_log,
             )
             return False
 
         if self._has_incomplete_file(course_path):
             self._logger.debug(
                 "CourseOrganizer[event=incomplete_blocked] item_phase=final item_course=%s",
-                course_name,
+                course_log,
             )
             self.save_data(state_key, {"signature": latest_signature, "stable_count": 0, "blocked": True})
             return False
 
         media_by_season, subtitle_by_season, has_explicit_season = self._collect_course_files(course_path)
         if not media_by_season:
-            self._logger.debug("CourseOrganizer[event=no_media] item_course=%s", course_name)
+            self._logger.debug("CourseOrganizer[event=no_media] item_course=%s", course_log)
             self.save_data(state_key, None)
             return False
 
@@ -1229,14 +3199,33 @@ class CourseOrganizer(_PluginBase):
         )
 
         mode = self._get_config().get("naming_mode")
+        manual_decision: Optional[naming.ManualOverride] = None
+        manual_binding: Optional[Dict[str, Any]] = None
         if mode == "off":
             decision = self._decision_from_config_off(course_name)
         else:
+            manual_decision = self._manual_decision_for(course_name)
+            if manual_decision is not None and manual_decision.action in {"confirm", "ignore", "candidate"}:
+                expected_binding = self._manual_binding(manual_decision)
+                if not self._source_binding_matches(course_name, expected_binding):
+                    self._logger.warning(
+                        "CourseOrganizer[event=manual_decision_stale] item_course_repr=%s",
+                        ascii(course_name),
+                    )
+                    manual_decision = naming.ManualOverride(course_name, "invalid")
+                elif manual_decision.action in {"confirm", "candidate"}:
+                    manual_binding = expected_binding
+            resolve_kwargs = (
+                {"manual_decision": manual_decision}
+                if manual_decision is not None
+                else {}
+            )
             decision = self._resolve_naming(
                 course_name,
                 directory_hints,
                 "",
                 "",
+                **resolve_kwargs,
             )
 
         route_result: Optional[LibraryRouteResult] = None
@@ -1253,24 +3242,41 @@ class CourseOrganizer(_PluginBase):
                 if mode == "preview":
                     self._logger.info(
                         "CourseOrganizer[event=preview] item_course=%s item_final=%s item_library=%s",
-                        course_name,
-                        decision.final_root,
+                        course_log,
+                        self._safe_log_value(decision.final_root),
                         "hold",
                     )
                     return False
                 self._logger.debug(
                     "CourseOrganizer[event=naming_blocked] item_course=%s item_reason=%s",
-                    course_name,
+                    course_log,
                     decision.status,
                 )
                 return False
 
-            route_result = self._resolve_library_route(course_name, decision, directory_hints)
-            target_library = route_result.library
+            manual_target = str(decision.target_library or "").lower()
+            if manual_target in naming.MANUAL_TARGET_LIBRARIES:
+                target_library = manual_target
+                output_key = {
+                    "tv": "tv_output",
+                    "movie": "movie_output",
+                    "children": "children_output",
+                }[target_library]
+                output_root = self._get_config().get(output_key)
+                route_result = LibraryRouteResult(
+                    accepted=True,
+                    library=target_library,
+                    confidence=1.0,
+                    reason_codes=("manual_confirm",),
+                    error="",
+                )
+            else:
+                route_result = self._resolve_library_route(course_name, decision, directory_hints)
+                target_library = route_result.library
             if not route_result.accepted:
                 self._logger.debug(
                     "CourseOrganizer[event=library_hold] item_course=%s item_confidence=%.3f item_reasons=%s",
-                    course_name,
+                    course_log,
                     route_result.confidence,
                     ",".join(route_result.reason_codes),
                 )
@@ -1288,7 +3294,7 @@ class CourseOrganizer(_PluginBase):
                     )
                 self._logger.debug(
                     "CourseOrganizer: %s held by library classification %s",
-                    course_name,
+                    course_log,
                     ",".join(route_result.reason_codes),
                 )
                 return False
@@ -1308,7 +3314,7 @@ class CourseOrganizer(_PluginBase):
                 if not getattr(os, "O_NOFOLLOW", 0) or not getattr(os, "O_DIRECTORY", 0):
                     self._logger.error(
                         "CourseOrganizer[event=secure_move_unsupported] item_course=%s",
-                        course_name,
+                        course_log,
                     )
                     return False
                 try:
@@ -1316,7 +3322,7 @@ class CourseOrganizer(_PluginBase):
                 except OSError:
                     self._logger.error(
                         "CourseOrganizer[event=destination_root_create_failed] item_course=%s",
-                        course_name,
+                        course_log,
                     )
                     return False
 
@@ -1335,8 +3341,8 @@ class CourseOrganizer(_PluginBase):
         if self._safe_name(decision.final_root) != self._safe_name(course_name) and os.path.isdir(legacy_output_root):
             self._logger.debug(
                 "CourseOrganizer[event=legacy_conflict] item_course=%s item_final=%s item_library=%s",
-                course_name,
-                decision.final_root,
+                course_log,
+                self._safe_log_value(decision.final_root),
                 target_library,
             )
             decision = self._decision_from_resolver(
@@ -1358,8 +3364,8 @@ class CourseOrganizer(_PluginBase):
         if mode == "preview":
             self._logger.info(
                 "CourseOrganizer[event=preview] item_course=%s item_final=%s item_library=%s",
-                course_name,
-                decision.final_root,
+                course_log,
+                self._safe_log_value(decision.final_root),
                 target_library,
             )
             return False
@@ -1367,7 +3373,7 @@ class CourseOrganizer(_PluginBase):
         if not decision.allowed_to_move:
             self._logger.debug(
                 "CourseOrganizer[event=naming_blocked] item_course=%s item_reason=%s",
-                course_name,
+                course_log,
                 decision.status,
             )
             return False
@@ -1376,25 +3382,30 @@ class CourseOrganizer(_PluginBase):
         if not self._is_within_realpath(output_root, output_course_root):
             self._logger.error(
                 "CourseOrganizer[event=destination_path_escape] item_course=%s",
-                course_name,
+                course_log,
             )
             return False
 
         self._logger.info(
             "CourseOrganizer[event=move_started] item_course=%s item_final=%s item_library=%s item_media_count=%d",
-            course_name,
-            decision.final_root,
+            course_log,
+            self._safe_log_value(decision.final_root),
             target_library,
             media_count,
         )
         if not self._is_within_realpath(output_root, output_course_root):
             self._logger.error(
                 "CourseOrganizer[event=destination_path_escape] item_course=%s",
-                course_name,
+                course_log,
             )
             return False
 
-        move_context = self._create_move_context(course_path, output_root)
+        move_context = self._create_move_context(
+            course_path,
+            output_root,
+            expected_manifest=(manual_binding or {}).get("source_manifest"),
+            expected_directories=(manual_binding or {}).get("source_directory_manifest"),
+        )
         if move_context is None:
             self.save_data(state_key, None)
             return False
@@ -1480,7 +3491,7 @@ class CourseOrganizer(_PluginBase):
             if not self._is_within_realpath(output_root, season_root):
                 self._logger.error(
                     "CourseOrganizer[event=destination_path_escape] item_course=%s",
-                    course_name,
+                    course_log,
                 )
                 self._rollback_move_context(move_context)
                 self._close_move_context(move_context)
@@ -1490,7 +3501,7 @@ class CourseOrganizer(_PluginBase):
             if not self._is_within_realpath(course_path, media_file):
                 self._logger.error(
                     "CourseOrganizer[event=source_path_escape] item_course=%s",
-                    course_name,
+                    course_log,
                 )
                 self._rollback_move_context(move_context)
                 self._close_move_context(move_context)
@@ -1498,7 +3509,7 @@ class CourseOrganizer(_PluginBase):
             if not self._is_within_realpath(output_root, target_media):
                 self._logger.error(
                     "CourseOrganizer[event=destination_path_escape] item_course=%s",
-                    course_name,
+                    course_log,
                 )
                 self._rollback_move_context(move_context)
                 self._close_move_context(move_context)
@@ -1508,7 +3519,7 @@ class CourseOrganizer(_PluginBase):
                 if not self._is_within_realpath(course_path, subtitle_file):
                     self._logger.error(
                         "CourseOrganizer[event=source_path_escape] item_course=%s",
-                        course_name,
+                        course_log,
                     )
                     self._rollback_move_context(move_context)
                     self._close_move_context(move_context)
@@ -1516,7 +3527,7 @@ class CourseOrganizer(_PluginBase):
                 if not self._is_within_realpath(output_root, target_subtitle):
                     self._logger.error(
                         "CourseOrganizer[event=destination_path_escape] item_course=%s",
-                        course_name,
+                        course_log,
                     )
                     self._rollback_move_context(move_context)
                     self._close_move_context(move_context)
@@ -1538,10 +3549,19 @@ class CourseOrganizer(_PluginBase):
 
         if moved_files:
             self._delete_if_empty_recursive(course_path)
+            decision_consumed = True
+            if manual_decision is not None and manual_decision.action == "confirm":
+                decision_consumed = self._consume_manual_decision(
+                    course_name,
+                    self._manual_binding(manual_decision),
+                )
+            if apply_result is not None:
+                apply_result["moved"] = True
+                apply_result["decision_consumed"] = decision_consumed
             self._logger.info(
                 "CourseOrganizer[event=move_completed] item_course=%s item_final=%s item_library=%s item_moved=%d item_subtitles=%d",
-                course_name,
-                decision.final_root,
+                course_log,
+                self._safe_log_value(decision.final_root),
                 target_library,
                 moved_files,
                 moved_subtitles,
@@ -1849,7 +3869,11 @@ class CourseOrganizer(_PluginBase):
 
     @classmethod
     def _open_nofollow_dir_chain(
-        cls, base_dir_fd: int, relative_path: str, create: bool = False
+        cls,
+        base_dir_fd: int,
+        relative_path: str,
+        create: bool = False,
+        created: Optional[List[Tuple[str, Tuple[int, int]]]] = None,
     ) -> int:
         no_follow = getattr(os, "O_NOFOLLOW", 0)
         dir_chain_flags = no_follow | os.O_RDONLY
@@ -1857,10 +3881,12 @@ class CourseOrganizer(_PluginBase):
             dir_chain_flags |= os.O_DIRECTORY
         flags = dir_chain_flags
         current_fd = os.dup(base_dir_fd)
+        components: List[str] = []
         try:
             for component in (part for part in relative_path.split(os.sep) if part and part != "."):
                 if component == "..":
                     raise ValueError("directory path escapes bound root")
+                components.append(component)
                 try:
                     next_fd = os.open(component, flags, dir_fd=current_fd)
                 except FileNotFoundError:
@@ -1868,6 +3894,15 @@ class CourseOrganizer(_PluginBase):
                         raise
                     os.mkdir(component, 0o755, dir_fd=current_fd)
                     next_fd = os.open(component, flags, dir_fd=current_fd)
+                    created_path = os.sep.join(components)
+                    created_stat = os.fstat(next_fd)
+                    if created is not None:
+                        created.append(
+                            (
+                                created_path,
+                                (int(created_stat.st_dev), int(created_stat.st_ino)),
+                            )
+                        )
                 if current_fd != base_dir_fd:
                     os.close(current_fd)
                 current_fd = next_fd
@@ -1917,6 +3952,98 @@ class CourseOrganizer(_PluginBase):
             os.fsync(directory_fd)
         except (OSError, TypeError, NotImplementedError, ValueError):
             pass
+
+    @staticmethod
+    def _rename_noreplace(
+        source_parent_fd: Optional[int],
+        source_name: str,
+        target_parent_fd: Optional[int],
+        target_name: str,
+    ) -> bool:
+        """Use a native atomic no-replace rename; unsupported means no-op."""
+        if source_parent_fd is None or target_parent_fd is None:
+            return False
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            source = os.fsencode(source_name)
+            target = os.fsencode(target_name)
+            if sys.platform == "darwin":
+                renameatx_np = getattr(libc, "renameatx_np", None)
+                if renameatx_np is None:
+                    return False
+                renameatx_np.argtypes = [
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_uint,
+                ]
+                renameatx_np.restype = ctypes.c_int
+                return (
+                    renameatx_np(
+                        source_parent_fd,
+                        source,
+                        target_parent_fd,
+                        target,
+                        4,
+                    )
+                    == 0
+                )
+            if sys.platform != "linux":
+                return False
+            renameat2 = getattr(libc, "renameat2", None)
+            if renameat2 is not None:
+                renameat2.argtypes = [
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_uint,
+                ]
+                renameat2.restype = ctypes.c_int
+                if renameat2(
+                    source_parent_fd,
+                    source,
+                    target_parent_fd,
+                    target,
+                    1,
+                ) == 0:
+                    return True
+                if ctypes.get_errno() != errno.ENOSYS:
+                    return False
+
+            syscall_numbers = {
+                "x86_64": 316,
+                "amd64": 316,
+                "aarch64": 276,
+                "arm64": 276,
+                "i386": 353,
+                "i686": 353,
+                "armv7l": 382,
+                "ppc64": 357,
+                "ppc64le": 357,
+                "s390x": 347,
+                "riscv64": 276,
+            }
+            machine = os.uname().machine
+            syscall_number = syscall_numbers.get(machine)
+            syscall = getattr(libc, "syscall", None)
+            if syscall_number is None or syscall is None:
+                return False
+            syscall.restype = ctypes.c_long
+            return (
+                syscall(
+                    syscall_number,
+                    source_parent_fd,
+                    source,
+                    target_parent_fd,
+                    target,
+                    1,
+                )
+                == 0
+            )
+        except (AttributeError, OSError, TypeError, ValueError, UnicodeError):
+            return False
 
     def _open_bound_root(self, root: str) -> Optional[Dict[str, Any]]:
         no_follow = getattr(os, "O_NOFOLLOW", 0)
@@ -1974,7 +4101,13 @@ class CourseOrganizer(_PluginBase):
                 except OSError:
                     pass
 
-    def _create_move_context(self, source_root: str, target_root: str) -> Optional[Dict[str, Any]]:
+    def _create_move_context(
+        self,
+        source_root: str,
+        target_root: str,
+        expected_manifest: Optional[Any] = None,
+        expected_directories: Optional[Any] = None,
+    ) -> Optional[Dict[str, Any]]:
         source = self._open_bound_root(source_root)
         target = self._open_bound_root(target_root)
         if source is None or target is None:
@@ -2016,7 +4149,18 @@ class CourseOrganizer(_PluginBase):
                 "counter": 0,
                 "staged": [],
                 "published": [],
+                "created_target_dirs": [],
                 "open_fds": [],
+                "expected_source_manifest": self._coerce_source_manifest(expected_manifest)
+                if expected_manifest is not None
+                else None,
+                "expected_source_directories": self._coerce_source_directory_manifest(
+                    expected_directories
+                )
+                if expected_directories is not None
+                else None,
+                "expected_remaining_source_manifest": None,
+                "expected_remaining_source_directories": None,
             }
             return context
         except (OSError, TypeError, NotImplementedError, ValueError):
@@ -2095,14 +4239,17 @@ class CourseOrganizer(_PluginBase):
             source_stat = os.fstat(source_fd)
             entry = self._regular_entry_stat(parent_fd, source_name)
             identity = (source_stat.st_dev, source_stat.st_ino)
-            if entry is None or (entry.st_dev, entry.st_ino) != identity:
+            if entry is None or not self._file_stat_matches(source_stat, entry):
+                return None
+            after = os.fstat(source_fd)
+            if not self._file_stat_matches(after, source_stat):
                 return None
             return {
                 "relative": relative,
                 "parent": parent_name,
                 "name": source_name,
                 "identity": identity,
-                "stat": source_stat,
+                "stat": after,
             }
         except (OSError, TypeError, NotImplementedError, ValueError):
             return None
@@ -2115,25 +4262,39 @@ class CourseOrganizer(_PluginBase):
                         pass
 
     def _restore_published_item(self, item: Dict[str, Any]) -> bool:
-        publication = item.get("published")
         source_parent_fd = item.get("source_parent_fd")
-        published_fd = publication.get("fd") if isinstance(publication, dict) else None
-        if source_parent_fd is None or not isinstance(published_fd, int):
+        original_fd = item.get("original_fd")
+        original_stat = item.get("original_stat")
+        if (
+            source_parent_fd is None
+            or not isinstance(original_fd, int)
+            or original_stat is None
+        ):
             return False
 
         current_source = self._entry_lstat(source_parent_fd, item["source_name"])
         if current_source is not None:
-            return (current_source.st_dev, current_source.st_ino) == item["identity"]
+            if (current_source.st_dev, current_source.st_ino) != item["identity"]:
+                return False
+            if isinstance(original_fd, int) and original_stat is not None:
+                try:
+                    if not self._file_stat_matches_without_ctime(
+                        os.fstat(original_fd), original_stat
+                    ):
+                        return False
+                except (OSError, TypeError, ValueError):
+                    return False
+            return True
 
         try:
-            published_stat = os.fstat(published_fd)
+            held_stat = os.fstat(original_fd)
             if (
-                not stat.S_ISREG(published_stat.st_mode)
-                or (published_stat.st_dev, published_stat.st_ino) != publication["identity"]
+                not stat.S_ISREG(held_stat.st_mode)
+                or (held_stat.st_dev, held_stat.st_ino) != item["identity"]
+                or not self._file_stat_matches_without_ctime(held_stat, original_stat)
             ):
                 return False
-            source_stat = item.get("stat")
-            mode = stat.S_IMODE(getattr(source_stat, "st_mode", 0o600))
+            source_stat = item.get("stat") or original_stat
             source_fd = os.open(
                 item["source_name"],
                 getattr(os, "O_NOFOLLOW", 0)
@@ -2142,7 +4303,7 @@ class CourseOrganizer(_PluginBase):
                 | os.O_EXCL
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_BINARY", 0),
-                mode,
+                stat.S_IMODE(getattr(source_stat, "st_mode", 0o600)),
                 dir_fd=source_parent_fd,
             )
         except (OSError, TypeError, NotImplementedError, ValueError):
@@ -2155,10 +4316,10 @@ class CourseOrganizer(_PluginBase):
             source_identity = (source_stat.st_dev, source_stat.st_ino)
             if not stat.S_ISREG(source_stat.st_mode):
                 return False
-            os.lseek(published_fd, 0, os.SEEK_SET)
-            remaining = published_stat.st_size
+            os.lseek(original_fd, 0, os.SEEK_SET)
+            remaining = original_stat.st_size
             while remaining:
-                chunk = os.read(published_fd, min(1024 * 1024, remaining))
+                chunk = os.read(original_fd, min(1024 * 1024, remaining))
                 if not chunk:
                     return False
                 remaining -= len(chunk)
@@ -2168,7 +4329,11 @@ class CourseOrganizer(_PluginBase):
                     if written <= 0:
                         return False
                     view = view[written:]
-            if os.read(published_fd, 1):
+            if os.read(original_fd, 1):
+                return False
+            if not self._file_stat_matches_without_ctime(
+                os.fstat(original_fd), original_stat
+            ):
                 return False
             os.fchmod(source_fd, stat.S_IMODE(getattr(item.get("stat"), "st_mode", 0o600)))
             source_times = item.get("stat")
@@ -2200,42 +4365,96 @@ class CourseOrganizer(_PluginBase):
     def _restore_staged_item(self, context: Dict[str, Any], item: Dict[str, Any]) -> bool:
         source_parent_fd = item.get("source_parent_fd")
         stage_fd = context["stage_fd"]
-        stage_entry = self._entry_lstat(stage_fd, item["stage_name"])
-        if stage_entry is None:
-            current_source = self._entry_lstat(source_parent_fd, item["source_name"])
-            if current_source is not None:
-                return (current_source.st_dev, current_source.st_ino) == item["identity"]
-            return self._restore_published_item(item)
-        if (stage_entry.st_dev, stage_entry.st_ino) != item.get("stage_identity"):
+        original_fd = item.get("original_fd")
+        original_stat = item.get("original_stat")
+        identity = item.get("identity")
+        if (
+            source_parent_fd is None
+            or stage_fd is None
+            or not isinstance(original_fd, int)
+            or original_stat is None
+            or not isinstance(identity, tuple)
+            or len(identity) != 2
+        ):
             return False
+        try:
+            held_original = os.fstat(original_fd)
+            if (
+                not stat.S_ISREG(held_original.st_mode)
+                or (held_original.st_dev, held_original.st_ino) != identity
+                or not self._file_stat_matches_without_ctime(held_original, original_stat)
+            ):
+                return False
+            stage_names = os.listdir(stage_fd)
+        except (OSError, TypeError, NotImplementedError, ValueError):
+            return False
+
+        original_entries = []
+        for candidate_name in stage_names:
+            candidate = self._regular_entry_stat(stage_fd, candidate_name)
+            if candidate is not None and (candidate.st_dev, candidate.st_ino) == identity:
+                original_entries.append((candidate_name, candidate))
+        if len(original_entries) > 1:
+            return False
+        if not original_entries:
+            return self._restore_published_item(item)
+
+        candidate_name, candidate_stat = original_entries[0]
         current_source = self._entry_lstat(source_parent_fd, item["source_name"])
         if current_source is not None:
-            if (current_source.st_dev, current_source.st_ino) == item["identity"]:
+            if (current_source.st_dev, current_source.st_ino) == identity:
                 restored = self._unlink_if_identity(
-                    stage_fd, item["stage_name"], item["stage_identity"]
+                    stage_fd, candidate_name, identity
                 )
                 if restored:
                     self._fsync_dir(source_parent_fd)
                     self._fsync_dir(stage_fd)
                 return restored
             return False
+        candidate_fd = None
         try:
+            candidate_fd = os.open(
+                candidate_name,
+                getattr(os, "O_NOFOLLOW", 0)
+                | os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=stage_fd,
+            )
+            held_candidate = os.fstat(candidate_fd)
+            current_candidate = self._regular_entry_stat(stage_fd, candidate_name)
+            if (
+                current_candidate is None
+                or (held_candidate.st_dev, held_candidate.st_ino) != identity
+                or (current_candidate.st_dev, current_candidate.st_ino) != identity
+                or not self._file_stat_matches_without_ctime(held_candidate, candidate_stat)
+            ):
+                return False
             _ORIGINAL_LINK(
-                item["stage_name"],
+                candidate_name,
                 item["source_name"],
                 src_dir_fd=stage_fd,
                 dst_dir_fd=source_parent_fd,
                 follow_symlinks=False,
             )
+            linked_source = self._entry_lstat(source_parent_fd, item["source_name"])
+            if linked_source is None or (linked_source.st_dev, linked_source.st_ino) != identity:
+                return False
+            restored = self._unlink_if_identity(stage_fd, candidate_name, identity)
+            if restored:
+                self._fsync_dir(source_parent_fd)
+                self._fsync_dir(stage_fd)
+            return restored
         except FileExistsError:
             return False
         except (OSError, TypeError, NotImplementedError, ValueError):
             return False
-        restored = self._unlink_if_identity(stage_fd, item["stage_name"], item["stage_identity"])
-        if restored:
-            self._fsync_dir(source_parent_fd)
-            self._fsync_dir(stage_fd)
-        return restored
+        finally:
+            if candidate_fd is not None:
+                try:
+                    os.close(candidate_fd)
+                except OSError:
+                    pass
 
     def _stage_move_source(
         self,
@@ -2247,28 +4466,58 @@ class CourseOrganizer(_PluginBase):
             return None
         root = context["source_root"]
         parent_fd = None
+        stage_name = None
+        original_fd = None
+        original_stat = None
+        original_identity = None
+        staged_entry = None
+        renamed = False
         try:
             parent_fd = self._open_nofollow_dir_chain(root["fd"], captured["parent"])
             context["open_fds"].append(parent_fd)
             current = self._regular_entry_stat(parent_fd, captured["name"])
-            if current is None or (current.st_dev, current.st_ino) != captured["identity"]:
+            if current is None or not self._file_stat_matches(current, captured["stat"]):
+                return None
+            original_fd = os.open(
+                captured["name"],
+                getattr(os, "O_NOFOLLOW", 0)
+                | os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_fd,
+            )
+            original_stat = os.fstat(original_fd)
+            original_identity = (original_stat.st_dev, original_stat.st_ino)
+            current = self._regular_entry_stat(parent_fd, captured["name"])
+            if (
+                not stat.S_ISREG(original_stat.st_mode)
+                or original_identity != captured["identity"]
+                or not self._file_stat_matches(original_stat, captured["stat"])
+                or current is None
+                or not self._file_stat_matches(current, original_stat)
+            ):
                 return None
             context["counter"] += 1
             stage_name = f"{context['counter']:08x}-{captured['name']}"
+            if self._entry_lstat(context["stage_fd"], stage_name) is not None:
+                return None
             os.rename(
                 captured["name"],
                 stage_name,
                 src_dir_fd=parent_fd,
                 dst_dir_fd=context["stage_fd"],
             )
+            renamed = True
             self._fsync_dir(parent_fd)
             self._fsync_dir(context["stage_fd"])
             staged_entry = self._entry_lstat(context["stage_fd"], stage_name)
+            staged_fd_stat = os.fstat(original_fd)
             staged = (
                 staged_entry
                 if staged_entry is not None
                 and stat.S_ISREG(staged_entry.st_mode)
-                and (staged_entry.st_dev, staged_entry.st_ino) == captured["identity"]
+                and original_identity == (staged_fd_stat.st_dev, staged_fd_stat.st_ino)
+                and self._file_stat_matches(staged_entry, staged_fd_stat)
                 else None
             )
             if staged is None:
@@ -2277,6 +4526,9 @@ class CourseOrganizer(_PluginBase):
                     "source_name": captured["name"],
                     "stage_name": stage_name,
                     "identity": captured["identity"],
+                    "original_fd": original_fd,
+                    "original_stat": original_stat,
+                    "stat": captured["stat"],
                     "stage_identity": (
                         (staged_entry.st_dev, staged_entry.st_ino)
                         if staged_entry is not None
@@ -2290,27 +4542,42 @@ class CourseOrganizer(_PluginBase):
                 "source_name": captured["name"],
                 "stage_name": stage_name,
                 "identity": captured["identity"],
+                "original_fd": original_fd,
+                "original_stat": original_stat,
                 "stage_identity": (staged.st_dev, staged.st_ino),
                 "stat": captured["stat"],
+                "staged_stat": staged,
                 "source": source,
             }
             context["staged"].append(item)
+            original_fd = None
             return item
         except (OSError, TypeError, NotImplementedError, ValueError):
-            if parent_fd is not None:
-                current = self._entry_lstat(context["stage_fd"], locals().get("stage_name", ""))
-                if current is not None:
-                    self._restore_staged_item(
-                        context,
-                        {
-                            "source_parent_fd": parent_fd,
-                            "source_name": captured["name"],
-                            "stage_name": locals().get("stage_name", ""),
-                            "identity": captured["identity"],
-                            "stage_identity": (current.st_dev, current.st_ino),
-                        },
-                    )
+            if renamed and parent_fd is not None and stage_name is not None:
+                current = self._entry_lstat(context["stage_fd"], stage_name)
+                item = {
+                    "source_parent_fd": parent_fd,
+                    "source_name": captured["name"],
+                    "stage_name": stage_name,
+                    "identity": original_identity or captured["identity"],
+                    "original_fd": original_fd,
+                    "original_stat": original_stat,
+                    "stat": captured["stat"],
+                    "stage_identity": (
+                        (current.st_dev, current.st_ino) if current is not None else None
+                    ),
+                }
+                try:
+                    self._restore_staged_item(context, item)
+                except (OSError, TypeError, NotImplementedError, ValueError, KeyError):
+                    pass
             return None
+        finally:
+            if original_fd is not None:
+                try:
+                    os.close(original_fd)
+                except OSError:
+                    pass
 
     def _publish_staged_move(
         self,
@@ -2331,10 +4598,16 @@ class CourseOrganizer(_PluginBase):
         published_fd = None
         source_fd = None
         try:
-            target_parent_fd = self._open_nofollow_dir_chain(root["fd"], target_parent, create=True)
+            target_parent_fd = self._open_nofollow_dir_chain(
+                root["fd"],
+                target_parent,
+                create=True,
+                created=context["created_target_dirs"],
+            )
             context["open_fds"].append(target_parent_fd)
             source_stat = self._regular_entry_stat(context["stage_fd"], item["stage_name"])
-            if source_stat is None or (source_stat.st_dev, source_stat.st_ino) != item["identity"]:
+            staged_stat = item.get("staged_stat", item["stat"])
+            if source_stat is None or not self._file_stat_matches(source_stat, staged_stat):
                 return False
             source_fd = os.open(
                 item["stage_name"],
@@ -2345,10 +4618,13 @@ class CourseOrganizer(_PluginBase):
                 dir_fd=context["stage_fd"],
             )
             source_stat = os.fstat(source_fd)
-            if (source_stat.st_dev, source_stat.st_ino) != item["identity"]:
+            if not self._file_stat_matches(source_stat, staged_stat):
                 return False
 
-            same_filesystem = os.fstat(target_parent_fd).st_dev == source_stat.st_dev
+            same_filesystem = (
+                os.fstat(target_parent_fd).st_dev == source_stat.st_dev
+                and context.get("expected_source_manifest") is None
+            )
             if same_filesystem:
                 try:
                     os.link(
@@ -2375,10 +4651,16 @@ class CourseOrganizer(_PluginBase):
                         | getattr(os, "O_NONBLOCK", 0),
                         dir_fd=target_parent_fd,
                     )
-                    published_stat = os.fstat(published_fd)
+                    published_fd_stat = os.fstat(published_fd)
+                    published_stat = self._regular_entry_stat(target_parent_fd, target_name)
                     if (
-                        not stat.S_ISREG(published_stat.st_mode)
-                        or (published_stat.st_dev, published_stat.st_ino) != published_identity
+                        published_stat is None
+                        or not self._file_stat_matches(published_stat, published_fd_stat)
+                    ):
+                        self._unlink_if_identity(target_parent_fd, target_name, published_identity)
+                        return False
+                    if not self._file_stat_matches_without_ctime(
+                        os.fstat(source_fd), staged_stat
                     ):
                         self._unlink_if_identity(target_parent_fd, target_name, published_identity)
                         return False
@@ -2387,7 +4669,11 @@ class CourseOrganizer(_PluginBase):
                         "parent_fd": target_parent_fd,
                         "name": target_name,
                         "identity": published_identity,
+                        "stage_identity": item["stage_identity"],
+                        "shared_stage": True,
                         "fd": published_fd,
+                        "stat": published_stat,
+                        "fd_stat": published_fd_stat,
                     }
                     context["published"].append(publication)
                     item["published"] = publication
@@ -2431,6 +4717,8 @@ class CourseOrganizer(_PluginBase):
                     view = view[written:]
             if os.read(source_fd, 1):
                 return False
+            if not self._file_stat_matches(os.fstat(source_fd), staged_stat):
+                return False
             os.fchmod(temp_fd, mode)
             os.utime(
                 temp_name,
@@ -2468,10 +4756,11 @@ class CourseOrganizer(_PluginBase):
                 | getattr(os, "O_NONBLOCK", 0),
                 dir_fd=target_parent_fd,
             )
-            published_stat = os.fstat(published_fd)
+            published_fd_stat = os.fstat(published_fd)
+            published_stat = self._regular_entry_stat(target_parent_fd, target_name)
             if (
-                not stat.S_ISREG(published_stat.st_mode)
-                or (published_stat.st_dev, published_stat.st_ino) != published_identity
+                published_stat is None
+                or not self._file_stat_matches(published_stat, published_fd_stat)
             ):
                 self._unlink_if_identity(target_parent_fd, target_name, published_identity)
                 return False
@@ -2480,7 +4769,11 @@ class CourseOrganizer(_PluginBase):
                 "parent_fd": target_parent_fd,
                 "name": target_name,
                 "identity": published_identity,
+                "stage_identity": item["stage_identity"],
+                "shared_stage": False,
                 "fd": published_fd,
+                "stat": published_stat,
+                "fd_stat": published_fd_stat,
             }
             context["published"].append(publication)
             item["published"] = publication
@@ -2506,12 +4799,18 @@ class CourseOrganizer(_PluginBase):
                         pass
 
     def _rollback_move_context(self, context: Dict[str, Any]) -> None:
+        cleanup = [
+            published
+            for published in reversed(context.get("published", []))
+            if self._publication_matches(published)
+        ]
         for item in reversed(context.get("staged", [])):
             self._restore_staged_item(context, item)
-        for published in reversed(context.get("published", [])):
+        for published in cleanup:
             self._unlink_if_identity(
                 published["parent_fd"], published["name"], published["identity"]
             )
+        self._remove_created_target_dirs(context)
         context["rolled_back"] = True
         stage_entry = self._entry_lstat(context["source_root"]["fd"], context["stage_name"])
         if (
@@ -2523,15 +4822,288 @@ class CourseOrganizer(_PluginBase):
             except OSError:
                 pass
 
+    def _remove_created_target_dirs(self, context: Dict[str, Any]) -> None:
+        root = context.get("target_root")
+        raw_created = context.get("created_target_dirs", ())
+        if not isinstance(raw_created, (list, tuple)):
+            return
+        created = list(raw_created)
+        flags = (
+            getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        created_by_path: Dict[str, Tuple[int, int]] = {}
+        for item in created:
+            if not isinstance(item, tuple) or len(item) != 2:
+                return
+            relative, identity = item
+            normalized = relative if isinstance(relative, str) else ""
+            components = normalized.split("/") if normalized else []
+            if (
+                not normalized
+                or normalized.startswith("/")
+                or normalized.endswith("/")
+                or "\\" in normalized
+                or "\x00" in normalized
+                or any(component in {"", ".", ".."} for component in components)
+                or os.path.normpath(normalized) != normalized
+                or not isinstance(identity, tuple)
+                or len(identity) != 2
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int) or value < 0
+                    for value in identity
+                )
+                or normalized in created_by_path
+            ):
+                return
+            created_by_path[normalized] = identity
+
+        if not root:
+            context["created_target_dirs"] = []
+            return
+        context["created_target_dirs"] = []
+
+        roots: List[str] = []
+        for relative in sorted(
+            created_by_path, key=lambda value: (value.count("/"), value)
+        ):
+            if not any(
+                relative == candidate or relative.startswith(f"{candidate}/")
+                for candidate in roots
+            ):
+                roots.append(relative)
+
+        def subtree_matches(
+            directory_fd: int,
+            identity: Tuple[int, int],
+            expected_directories: Tuple[Tuple[str, int, int], ...],
+        ) -> bool:
+            try:
+                current = os.fstat(directory_fd)
+                if (
+                    not stat.S_ISDIR(current.st_mode)
+                    or (current.st_dev, current.st_ino) != identity
+                ):
+                    return False
+                tree = self._scan_manifest_dir(directory_fd)
+                if tree is None:
+                    return False
+                files, directories = tree
+                directories.sort(key=lambda item: item[0])
+                return not files and tuple(directories) == expected_directories
+            except (OSError, TypeError, NotImplementedError, ValueError):
+                return False
+
+        for relative in roots:
+            identity = created_by_path[relative]
+            expected_descendants = tuple(
+                sorted(
+                    (
+                        candidate[len(relative) + 1 :],
+                        descendant_identity[0],
+                        descendant_identity[1],
+                    )
+                    for candidate, descendant_identity in created_by_path.items()
+                    if candidate.startswith(f"{relative}/")
+                )
+            )
+            parent_relative, name = os.path.split(relative)
+            parent_fd = child_fd = quarantine_fd = None
+            quarantine_name = None
+            try:
+                parent_fd = self._open_nofollow_dir_chain(root["fd"], parent_relative)
+                entry = self._entry_lstat(parent_fd, name)
+                if (
+                    entry is None
+                    or not stat.S_ISDIR(entry.st_mode)
+                    or (entry.st_dev, entry.st_ino) != identity
+                ):
+                    continue
+                child_fd = os.open(name, flags, dir_fd=parent_fd)
+                if not subtree_matches(child_fd, identity, expected_descendants):
+                    continue
+                for _ in range(100):
+                    candidate = f".courseorganizer-rollback-{uuid.uuid4().hex}"
+                    if self._rename_noreplace(parent_fd, name, parent_fd, candidate):
+                        quarantine_name = candidate
+                        break
+                if quarantine_name is None:
+                    continue
+                quarantine = self._entry_lstat(parent_fd, quarantine_name)
+                if (
+                    quarantine is None
+                    or not stat.S_ISDIR(quarantine.st_mode)
+                    or (quarantine.st_dev, quarantine.st_ino) != identity
+                ):
+                    self._restore_quarantined_dir(parent_fd, name, quarantine_name, identity)
+                    continue
+                quarantine_fd = os.open(quarantine_name, flags, dir_fd=parent_fd)
+                if not subtree_matches(quarantine_fd, identity, expected_descendants):
+                    self._restore_quarantined_dir(parent_fd, name, quarantine_name, identity)
+                    continue
+                # Keep one identity-checked quarantine rather than doing a
+                # final name-based rmdir that could target a replacement.
+                self._fsync_dir(parent_fd)
+                if not subtree_matches(quarantine_fd, identity, expected_descendants):
+                    self._restore_quarantined_dir(parent_fd, name, quarantine_name, identity)
+                    continue
+                quarantine = self._entry_lstat(parent_fd, quarantine_name)
+                if (
+                    quarantine is None
+                    or not stat.S_ISDIR(quarantine.st_mode)
+                    or (quarantine.st_dev, quarantine.st_ino) != identity
+                ):
+                    self._restore_quarantined_dir(parent_fd, name, quarantine_name, identity)
+                    continue
+            except (OSError, TypeError, NotImplementedError, ValueError):
+                if parent_fd is not None and quarantine_name is not None:
+                    self._restore_quarantined_dir(parent_fd, name, quarantine_name, identity)
+                continue
+            finally:
+                for fd in (quarantine_fd, child_fd, parent_fd):
+                    if fd is not None:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+
+    def _restore_quarantined_dir(
+        self,
+        parent_fd: Optional[int],
+        name: str,
+        quarantine_name: str,
+        identity: Tuple[int, int],
+    ) -> bool:
+        quarantine = self._entry_lstat(parent_fd, quarantine_name)
+        if (
+            quarantine is None
+            or not stat.S_ISDIR(quarantine.st_mode)
+            or (quarantine.st_dev, quarantine.st_ino) != identity
+            or self._entry_lstat(parent_fd, name) is not None
+        ):
+            return False
+        return self._rename_noreplace(parent_fd, quarantine_name, parent_fd, name)
+
+    def _move_context_remaining_matches(self, context: Dict[str, Any]) -> bool:
+        expected_files = context.get("expected_remaining_source_manifest")
+        expected_dirs = context.get("expected_remaining_source_directories")
+        if expected_files is None or expected_dirs is None:
+            return True
+        if not self._move_context_is_current(context):
+            return False
+        current_tree = self._scan_manifest_dir(
+            context["source_root"]["fd"],
+            excluded_root=(context["stage_name"], context["stage_identity"]),
+        )
+        if current_tree is None:
+            return False
+        current_files, current_dirs = current_tree
+        current_files.sort(key=lambda item: item[0])
+        current_dirs.sort(key=lambda item: item[0])
+        return (
+            tuple(current_files) == tuple(expected_files)
+            and tuple(current_dirs) == tuple(expected_dirs)
+        )
+
+    def _publication_matches(
+        self, publication: Dict[str, Any], *, include_ctime: bool = True
+    ) -> bool:
+        stat_matches = (
+            self._file_stat_matches
+            if include_ctime
+            else self._file_stat_matches_without_ctime
+        )
+        try:
+            parent_fd = publication.get("parent_fd")
+            published_fd = publication.get("fd")
+            expected_identity = publication.get("identity")
+            expected_stat = publication.get("stat")
+            expected_fd_stat = publication.get("fd_stat")
+            if (
+                parent_fd is None
+                or not isinstance(published_fd, int)
+                or expected_identity is None
+                or expected_stat is None
+                or expected_fd_stat is None
+            ):
+                return False
+            path_stat = self._regular_entry_stat(parent_fd, publication["name"])
+            held_stat = os.fstat(published_fd)
+            return bool(
+                path_stat is not None
+                and (path_stat.st_dev, path_stat.st_ino) == expected_identity
+                and (held_stat.st_dev, held_stat.st_ino) == expected_identity
+                and stat_matches(path_stat, expected_stat)
+                and stat_matches(held_stat, expected_fd_stat)
+                and stat_matches(path_stat, held_stat)
+            )
+        except (OSError, TypeError, NotImplementedError, ValueError):
+            return False
+
+    def _refresh_shared_publications(
+        self, context: Dict[str, Any], item: Dict[str, Any]
+    ) -> bool:
+        for publication in context.get("published", ()):
+            if not publication.get("shared_stage") or publication.get("stage_identity") != item.get(
+                "stage_identity"
+            ):
+                continue
+            try:
+                path_stat = self._regular_entry_stat(
+                    publication.get("parent_fd"), publication["name"]
+                )
+                held_stat = os.fstat(publication["fd"])
+                if (
+                    path_stat is None
+                    or not self._file_stat_matches_without_ctime(
+                        path_stat, publication["stat"]
+                    )
+                    or not self._file_stat_matches_without_ctime(
+                        held_stat, publication["fd_stat"]
+                    )
+                    or not self._file_stat_matches(path_stat, held_stat)
+                ):
+                    return False
+                publication["stat"] = path_stat
+                publication["fd_stat"] = held_stat
+            except (OSError, TypeError, NotImplementedError, ValueError):
+                return False
+        return True
+
+    def _move_context_published_matches(
+        self, context: Dict[str, Any], *, include_ctime: bool = True
+    ) -> bool:
+        return all(
+            self._publication_matches(publication, include_ctime=include_ctime)
+            for publication in context.get("published", ())
+        )
+
     def _commit_move_context(self, context: Dict[str, Any]) -> bool:
         if not self._move_context_is_current(context):
+            return False
+        stage_entry = self._entry_lstat(context["source_root"]["fd"], context["stage_name"])
+        if (
+            stage_entry is None
+            or (stage_entry.st_dev, stage_entry.st_ino) != context["stage_identity"]
+            or not self._move_context_remaining_matches(context)
+            or not self._move_context_published_matches(context)
+        ):
             return False
         for item in context.get("staged", []):
             if not self._unlink_if_identity(
                 context["stage_fd"], item["stage_name"], item["stage_identity"]
             ):
                 return False
+            if not self._refresh_shared_publications(context, item):
+                return False
         self._fsync_dir(context["stage_fd"])
+        if (
+            not self._move_context_remaining_matches(context)
+            or not self._move_context_published_matches(context, include_ctime=False)
+        ):
+            return False
         stage_entry = self._entry_lstat(context["source_root"]["fd"], context["stage_name"])
         if (
             stage_entry is None
@@ -2543,6 +5115,11 @@ class CourseOrganizer(_PluginBase):
         except OSError:
             return False
         self._fsync_dir(context["source_root"]["fd"])
+        if (
+            not self._move_context_remaining_matches(context)
+            or not self._move_context_published_matches(context, include_ctime=False)
+        ):
+            return False
         context["committed"] = True
         return True
 
@@ -2557,6 +5134,7 @@ class CourseOrganizer(_PluginBase):
                 fds.extend((bound.get("parent_fd"), bound.get("fd")))
         for item in context.get("staged", []):
             fds.append(item.get("source_parent_fd"))
+            fds.append(item.get("original_fd"))
         for item in context.get("published", []):
             fds.append(item.get("parent_fd"))
             fds.append(item.get("fd"))
@@ -2619,6 +5197,50 @@ class CourseOrganizer(_PluginBase):
             return None
         try:
             identities: Dict[str, Dict[str, Any]] = {}
+            expected_manifest = context.get("expected_source_manifest")
+            expected_directories = context.get("expected_source_directories")
+            if expected_manifest is not None:
+                if expected_directories is None:
+                    self._rollback_move_context(context)
+                    return None
+                expected_by_path = {item[0]: item for item in expected_manifest}
+                excluded_stage = (
+                    context["stage_name"],
+                    context["stage_identity"],
+                )
+
+                def manifest_matches(
+                    expected_files: Tuple[Tuple[str, int, int, int, int, int], ...],
+                    expected_dirs: Tuple[Tuple[str, int, int], ...],
+                ) -> bool:
+                    current_tree = self._scan_manifest_dir(
+                        context["source_root"]["fd"],
+                        excluded_root=excluded_stage,
+                    )
+                    if current_tree is None:
+                        return False
+                    current_files, current_dirs = current_tree
+                    current_files.sort(key=lambda item: item[0])
+                    current_dirs.sort(key=lambda item: item[0])
+                    return (
+                        tuple(current_files) == expected_files
+                        and tuple(current_dirs) == expected_dirs
+                    )
+
+                expected_files = tuple(expected_manifest)
+                expected_dirs = tuple(expected_directories)
+                if not manifest_matches(expected_files, expected_dirs):
+                    self._rollback_move_context(context)
+                    return None
+                for relative, expected in expected_by_path.items():
+                    candidate = os.path.join(source_root, *relative.split("/"))
+                    captured = self._capture_move_identity(context, candidate)
+                    if captured is None or not self._manifest_stat_matches(
+                        captured["stat"], expected
+                    ):
+                        self._rollback_move_context(context)
+                        return None
+                    identities[candidate] = captured
             for media_file, _, subtitle_pairs in move_plan:
                 for candidate in [media_file, *(subtitle_file for subtitle_file, _ in subtitle_pairs)]:
                     if candidate not in identities:
@@ -2627,32 +5249,83 @@ class CourseOrganizer(_PluginBase):
                             self._rollback_move_context(context)
                             return None
                         identities[candidate] = captured
-
-            moved_files = moved_subtitles = 0
-            for media_file, target_media, subtitle_pairs in move_plan:
-                if not self._move_file(
-                    media_file,
-                    target_media,
-                    source_root=source_root,
-                    target_root=target_root,
-                    move_context=context,
-                    source_identity=identities[media_file],
-                ):
+            if expected_manifest is not None:
+                expected_paths = set(expected_by_path)
+                if {
+                    self._safe_relative_path(source_root, candidate).replace(os.sep, "/")
+                    for candidate in identities
+                    if self._safe_relative_path(source_root, candidate) is not None
+                } != expected_paths:
                     self._rollback_move_context(context)
                     return None
-                moved_files += 1
-                for subtitle_file, target_subtitle in subtitle_pairs:
-                    if not self._move_file(
-                        subtitle_file,
-                        target_subtitle,
-                        source_root=source_root,
-                        target_root=target_root,
-                        move_context=context,
-                        source_identity=identities[subtitle_file],
+                planned_files: List[Tuple[str, str, Optional[str]]] = []
+                for media_file, target_media, subtitle_pairs in move_plan:
+                    planned_files.append((media_file, target_media, None))
+                    for subtitle_file, target_subtitle in subtitle_pairs:
+                        planned_files.append((subtitle_file, target_subtitle, media_file))
+                if any(candidate not in identities for candidate, _, _ in planned_files):
+                    self._rollback_move_context(context)
+                    return None
+                staged_items: Dict[str, Dict[str, Any]] = {}
+                for candidate, _, _ in planned_files:
+                    staged = self._stage_move_source(
+                        context,
+                        candidate,
+                        identities[candidate],
+                    )
+                    if staged is None:
+                        self._rollback_move_context(context)
+                        return None
+                    staged_items[candidate] = staged
+                staged_paths = {
+                    identities[candidate]["relative"].replace(os.sep, "/")
+                    for candidate, _, _ in planned_files
+                }
+                expected_remaining = tuple(
+                    item for item in expected_files if item[0] not in staged_paths
+                )
+                context["expected_remaining_source_manifest"] = expected_remaining
+                context["expected_remaining_source_directories"] = expected_dirs
+                if not manifest_matches(expected_remaining, expected_dirs):
+                    self._rollback_move_context(context)
+                    return None
+                for candidate, target, _ in planned_files:
+                    if not self._publish_staged_move(
+                        context, staged_items[candidate], target
                     ):
                         self._rollback_move_context(context)
                         return None
-                    moved_subtitles += 1
+                if not manifest_matches(expected_remaining, expected_dirs):
+                    self._rollback_move_context(context)
+                    return None
+                moved_files = sum(1 for _, _, parent in planned_files if parent is None)
+                moved_subtitles = len(planned_files) - moved_files
+            else:
+                moved_files = moved_subtitles = 0
+                for media_file, target_media, subtitle_pairs in move_plan:
+                    if not self._move_file(
+                        media_file,
+                        target_media,
+                        source_root=source_root,
+                        target_root=target_root,
+                        move_context=context,
+                        source_identity=identities[media_file],
+                    ):
+                        self._rollback_move_context(context)
+                        return None
+                    moved_files += 1
+                    for subtitle_file, target_subtitle in subtitle_pairs:
+                        if not self._move_file(
+                            subtitle_file,
+                            target_subtitle,
+                            source_root=source_root,
+                            target_root=target_root,
+                            move_context=context,
+                            source_identity=identities[subtitle_file],
+                        ):
+                            self._rollback_move_context(context)
+                            return None
+                        moved_subtitles += 1
 
             if not self._commit_move_context(context):
                 self._rollback_move_context(context)

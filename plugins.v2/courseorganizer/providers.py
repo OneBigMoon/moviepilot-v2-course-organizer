@@ -598,9 +598,14 @@ class MoviePilotAIReviewer:
 
 
 class MoviePilotLibraryClassifier:
-    """Strict AI gate for routing an item into one of the three media libraries."""
+    """AI gate for routing an item into one of the three media libraries.
 
-    MIN_CONFIDENCE = 0.90
+    Confidence below MIN_CONFIDENCE is held for manual review. The bar is
+    intentionally strict for tv/movie (metadata type must agree), while
+    children only needs a confident audience signal.
+    """
+
+    MIN_CONFIDENCE = 0.85
 
     def __init__(
         self,
@@ -706,7 +711,11 @@ class MoviePilotLibraryClassifier:
                 return LibraryRouteResult(False, "hold", confidence, ("invalid_library",), "invalid_library")
             if library == "hold":
                 return LibraryRouteResult(False, "hold", confidence, reason_codes or ("ai_hold",), "")
-            if not math.isfinite(confidence) or confidence < self.MIN_CONFIDENCE or confidence > 1.0:
+            if (
+                not math.isfinite(confidence)
+                or confidence < self.MIN_CONFIDENCE
+                or confidence > 1.0
+            ):
                 return LibraryRouteResult(False, "hold", confidence, ("low_confidence",), "")
             if library in {"tv", "movie"} and normalized_type != library:
                 return LibraryRouteResult(False, "hold", confidence, ("metadata_type_conflict",), "")

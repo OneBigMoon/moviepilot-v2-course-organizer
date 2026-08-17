@@ -193,7 +193,7 @@ def test_non_movable_naming_statuses_skip_library_classification(tmp_path, statu
 
 def test_classifier_rejects_low_confidence_and_metadata_conflict():
     low = MoviePilotLibraryClassifier(
-        invoke_fn=lambda payload: {"library": "children", "confidence": 0.89}
+        invoke_fn=lambda payload: {"library": "children", "confidence": 0.84}
     ).classify("标题", "标题", "tv", True)
     conflict = MoviePilotLibraryClassifier(
         invoke_fn=lambda payload: {"library": "tv", "confidence": 0.99}
@@ -259,3 +259,14 @@ def test_naming_decision_and_preview_preserve_metadata_type():
 
     assert decision.media_type == "tv"
     assert data["naming_preview_v1"][-1]["media_type"] == "tv"
+def test_classifier_accepts_minimum_confidence_boundary():
+    children = MoviePilotLibraryClassifier(
+        invoke_fn=lambda payload: {"library": "children", "confidence": 0.85}
+    ).classify("儿童课程", "儿童课程", "unknown", True)
+    tv = MoviePilotLibraryClassifier(
+        invoke_fn=lambda payload: {"library": "tv", "confidence": 0.85}
+    ).classify("示例剧", "示例剧", "tv", True)
+
+    assert children.accepted and children.library == "children"
+    assert children.reason_codes == ()
+    assert tv.accepted and tv.library == "tv"

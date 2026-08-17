@@ -8,8 +8,22 @@ __pycache__/
 .coverage
 htmlcov/
 
+# Vue plugin dependencies (the reproducible lockfile and built dist are kept)
+plugins.v2/courseorganizer/node_modules/
+
 # Packaging artifacts
 *.egg-info/
 
 # OS/editor files
 .DS_Store
+
+# Agent toolchain / local runtime artifacts (never commit)
+.omc/
+artifacts/
+runtime.db
+runtime.db-shm
+runtime.db-wal
+
+# Release archives & build manifests
+*.tar.gz
+MANIFEST.sha256
