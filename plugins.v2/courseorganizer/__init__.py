@@ -272,7 +272,7 @@ class CourseOrganizer(_PluginBase):
     plugin_config_prefix = "courseorganizer_"
     auth_level = 1
     plugin_order = 90
-    plugin_version = "1.5.14"
+    plugin_version = "1.5.15"
     plugin_desc = "稳定后识别、分类并整理到电视剧、电影或儿童媒体库"
     plugin_author = "OpenAI"
     plugin_icon = "icons/courseorganizer.svg"
