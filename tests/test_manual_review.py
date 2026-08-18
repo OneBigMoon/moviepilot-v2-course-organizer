@@ -34,6 +34,7 @@ class _TestNativeAdapter:
                 "library_storage": "local",
                 "transfer_type": "move",
                 "renaming": True,
+                "naming_format": "{{title}} {{year}}/Season {{season}}/{{title}} - {{season}}x{{episode}} - 第{{episode}}集",
             },
             {
                 "name": "电影",
@@ -44,6 +45,7 @@ class _TestNativeAdapter:
                 "library_storage": "local",
                 "transfer_type": "move",
                 "renaming": True,
+                "movie_naming_format": "{{title}} ({{year}})",
             },
             {
                 "name": "儿童课程",
@@ -1680,17 +1682,51 @@ def test_confirm_allows_no_media_identity_direct_transfer():
     )
 
     assert _success(response)
-    # 直接搬移 + 重组成标准剧集结构：源目录被移到目标媒体库/最终名称/Season 1/S01E01.mp4，源目录消失
+    # 直接搬移 + 按 MoviePilot 配置的电视剧重命名格式重组：
+    # 目标媒体库/课程 (2024)/Season 1/课程 - 1x1 - 第1集.mp4，源目录消失
     dest_season1 = Path(native.config["tv_output"]) / "课程 (2024)" / "Season 1"
-    assert (dest_season1 / "S01E01.mp4").exists()
-    # 前置序号(10.标题)重命名为 S01E10
-    assert (dest_season1 / "S01E10.mp4").exists()
+    assert (dest_season1 / "课程 - 1x1 - 第1集.mp4").exists()
+    # 前置序号(10.标题)使用配置格式命名
+    assert (dest_season1 / "课程 - 1x10 - 第10集.mp4").exists()
     assert not (Path(native.config["incoming"]) / "课程").exists()
     # 未走 MoviePilot native 识别路径
     assert native.calls == []
 
 
-def test_confirm_delegates_single_item_to_moviepilot_native_rule():
+def test_confirm_no_media_identity_uses_movie_naming_format():
+    # 目标媒体库=电影时，直接用 MoviePilot 配置的电影重命名格式命名
+    native = _TestNativeAdapter(
+        {
+            "incoming": tempfile.mkdtemp(),
+            "tv_output": tempfile.mkdtemp(),
+            "movie_output": tempfile.mkdtemp(),
+            "children_output": tempfile.mkdtemp(),
+        }
+    )
+    organizer = _organizer(
+        [_row("影集", target_library="movie", source="", media_id="")],
+        native_adapter=native,
+        incoming=native.config["incoming"],
+        tv_output=native.config["tv_output"],
+        movie_output=native.config["movie_output"],
+        children_output=native.config["children_output"],
+    )
+    (Path(native.config["incoming"]) / "影集").mkdir(parents=True, exist_ok=True)
+    (Path(native.config["incoming"]) / "影集" / "1.mp4").write_bytes(b"media")
+    row = _data_item(organizer.get_review(), "影集")
+    response = organizer.save_review(
+        {
+            "raw_title": "影集",
+            "revision": row["revision"],
+            "action": "confirm",
+            "final_title": "影集 (2001)",
+            "target_library": "movie",
+        }
+    )
+    assert _success(response)
+    # 电影格式 {{title}} ({{year}}) => 影集 (2001).mp4（无 Season 子目录）
+    assert (Path(native.config["movie_output"]) / "影集 (2001)" / "影集 (2001).mp4").exists()
+    assert native.calls == []
     with tempfile.TemporaryDirectory() as root:
         root_path = Path(root)
         config = {
