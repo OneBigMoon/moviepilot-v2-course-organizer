@@ -1666,6 +1666,7 @@ def test_confirm_allows_no_media_identity_direct_transfer():
     )
     (Path(native.config["incoming"]) / "课程").mkdir(parents=True, exist_ok=True)
     (Path(native.config["incoming"]) / "课程" / "S01E01.mp4").write_bytes(b"media")
+    (Path(native.config["incoming"]) / "课程" / "10.友好的汽车世界.mp4").write_bytes(b"media")
     row = _data_item(organizer.get_review(), "课程")
 
     response = organizer.save_review(
@@ -1682,6 +1683,8 @@ def test_confirm_allows_no_media_identity_direct_transfer():
     # 直接搬移 + 重组成标准剧集结构：源目录被移到目标媒体库/最终名称/Season 1/S01E01.mp4，源目录消失
     dest_season1 = Path(native.config["tv_output"]) / "课程 (2024)" / "Season 1"
     assert (dest_season1 / "S01E01.mp4").exists()
+    # 前置序号(10.标题)重命名为 S01E10
+    assert (dest_season1 / "S01E10.mp4").exists()
     assert not (Path(native.config["incoming"]) / "课程").exists()
     # 未走 MoviePilot native 识别路径
     assert native.calls == []

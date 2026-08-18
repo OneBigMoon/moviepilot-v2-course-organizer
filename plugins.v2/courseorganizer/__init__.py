@@ -318,7 +318,7 @@ class CourseOrganizer(_PluginBase):
     plugin_config_prefix = "courseorganizer_"
     auth_level = 1
     plugin_order = 90
-    plugin_version = "1.6.9"
+    plugin_version = "1.7.0"
     plugin_desc = "稳定后识别、分类并整理到电视剧、电影或儿童媒体库"
     plugin_author = "OpenAI"
     plugin_icon = "icons/courseorganizer.svg"
@@ -2482,6 +2482,17 @@ class CourseOrganizer(_PluginBase):
             return season, start, None
         return None
 
+    @staticmethod
+    def _parse_bare_episode(name: str) -> Optional[int]:
+        """从文件名开头的序号解析集号，如 '10.标题'、'01-标题'、'10 标题'、或纯 '10'。"""
+        s = str(name).strip()
+        m = re.match(r"^\s*(\d{1,3})(?:[.\s_\-]+|$)", s)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 999:
+                return n
+        return None
+
     @classmethod
     def _folder_season(cls, path: str) -> Optional[int]:
         """从父目录名判断季（Season 1 / 第1季）。"""
@@ -2509,6 +2520,12 @@ class CourseOrganizer(_PluginBase):
         for root, rel_root, fn, folder_season in files:
             stem = os.path.splitext(fn)[0]
             parsed = self._parse_season_episode(stem)
+            if parsed is None:
+                # 无 "S01E01/第N季第N集" 时，尝试文件名开头的序号作为集号（如 "10.标题"、"01-标题"），
+                # 季取所在 Season 文件夹（Season 1）。
+                bare_ep = self._parse_bare_episode(stem)
+                if bare_ep is not None:
+                    parsed = (folder_season if folder_season is not None else 1, bare_ep, None)
             season = parsed[0] if parsed else folder_season
             if parsed is None and season is None:
                 # 无法识别季/集，保持原样（放一层 Season 1 或就在根）
