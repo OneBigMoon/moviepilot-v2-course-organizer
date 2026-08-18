@@ -868,6 +868,78 @@ class SmartNamingResolver:
             return tuple(getter(requested))
         return ("themoviedb", "douban")
 
+    def _augment_fallback_queries(
+        self,
+        hints: "naming.TitleHints",
+        raw_title: str,
+    ) -> "naming.TitleHints":
+        """在主解析查询词之外，追加去掉常见修饰词后的短名查询，作为搜索回退。"""
+        primary = tuple(hints.query_candidates or ())
+        seen = set()
+        extra_texts = []
+        for cand in primary:
+            seen.add(naming.normalize_title(cand.text))
+        # 关键：从本地标题/原始名生成回退短名
+        base = hints.local_title or hints.raw_title or raw_title
+        for cand in primary:
+            base = cand.text or base
+            break
+        variants = self._trim_variants(base)
+        for text in variants:
+            key = naming.normalize_title(text)
+            if key and key not in seen:
+                seen.add(key)
+                extra_texts.append(text)
+        if not extra_texts or not hasattr(hints, "query_candidates"):
+            return hints
+        try:
+            from .naming import QueryCandidate
+        except Exception:
+            QueryCandidate = None
+        if QueryCandidate is None:
+            return hints
+        try:
+            new_queries = list(primary) + [
+                QueryCandidate(text=text, origin="fallback", quality_bonus=0)
+                for text in extra_texts
+            ]
+            return hints._replace(query_candidates=tuple(new_queries))
+        except Exception:
+            return hints
+
+    def _trim_variants(self, text: str) -> list:
+        """生成从完整名逐步去掉常见修饰词后的短名变体。"""
+        text = str(text or "").strip()
+        if not text:
+            return []
+        out = []
+        cur = text
+        # 常见中文/标题修饰后缀
+        suffixes = [
+            "高清修复版", "修复版", "高清版", "未删减版", "未删减",
+            "高清", "修复", "蓝光", "收藏版", "全集", "国语", "中字",
+        ]
+        changed = True
+        while changed:
+            changed = False
+            for suf in suffixes:
+                if cur.endswith(suf):
+                    cur = cur[: -len(suf)].strip()
+                    if cur:
+                        out.append(cur)
+                    changed = True
+                    break
+            if len(cur) <= 1:
+                break
+        # 若存在全角/半角括号年份，保留核心名
+        import re
+        core = re.sub(r"[（(\s]*\d{4}[）)\s]*$", "", cur)
+        if core and core != cur:
+            out.append(core.strip())
+        if cur and all(cur != x for x in out):
+            out.append(cur)
+        return list(dict.fromkeys([x for x in out if x]))
+
     def search_tmdb_candidates(
         self,
         raw_title: str,
@@ -882,6 +954,9 @@ class SmartNamingResolver:
             return ProviderSearchResult((), ("themoviedb_not_enabled",), (), True)
 
         hints = naming.parse_title(raw_title)
+        # 搜索词自动回退：主解析词搜不到时，追加去掉常见修饰词后的短名，
+        # 提高命中率（例如"黑冰高清修复版"→回退"黑冰"）。
+        hints = self._augment_fallback_queries(hints, raw_title)
         sources = self._provider_search_sources(("themoviedb",))
         if "themoviedb" not in sources:
             return ProviderSearchResult((), ("themoviedb_unavailable",), (), True)

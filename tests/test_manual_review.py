@@ -1645,7 +1645,9 @@ def test_tmdb_association_uses_exact_selected_tmdb_title_not_raw_english_alias()
     assert latest["target_path"].endswith("/飘飘叶 (2013)")
 
 
-def test_confirm_requires_reliable_media_identity_before_native_transfer():
+def test_confirm_allows_no_media_identity_direct_transfer():
+    # 用户要求：无媒体 ID（课程等不在 TMDB 上）也能"保存并整理"。
+    # 无媒体身份时确认应放行，并走"直接按标题搬移"：源目录移到目标媒体库/最终名称下，源消失。
     native = _TestNativeAdapter(
         {
             "incoming": tempfile.mkdtemp(),
@@ -1655,13 +1657,15 @@ def test_confirm_requires_reliable_media_identity_before_native_transfer():
         }
     )
     organizer = _organizer(
-        [_row("课程", source="local", media_id="")],
+        [_row("课程", target_library="tv", source="", media_id="")],
         native_adapter=native,
         incoming=native.config["incoming"],
         tv_output=native.config["tv_output"],
         movie_output=native.config["movie_output"],
         children_output=native.config["children_output"],
     )
+    (Path(native.config["incoming"]) / "课程").mkdir(parents=True, exist_ok=True)
+    (Path(native.config["incoming"]) / "课程" / "1.mkv").write_bytes(b"media")
     row = _data_item(organizer.get_review(), "课程")
 
     response = organizer.save_review(
@@ -1674,10 +1678,13 @@ def test_confirm_requires_reliable_media_identity_before_native_transfer():
         }
     )
 
-    assert not _success(response)
-    assert "关联 TMDB" in _message(response)
+    assert _success(response)
+    # 直接搬移：源目录被移到目标媒体库的最终名称下，源目录不再存在
+    dest_dir = Path(native.config["tv_output"]) / "课程 (2024)"
+    assert (dest_dir / "1.mkv").exists()
+    assert not (Path(native.config["incoming"]) / "课程").exists()
+    # 未走 MoviePilot native 识别路径
     assert native.calls == []
-    assert (Path(native.config["incoming"]) / "课程").exists()
 
 
 def test_confirm_delegates_single_item_to_moviepilot_native_rule():

@@ -19,6 +19,8 @@ const savingKeys = ref([])
 const organizingKey = ref('')
 const tmdbLoadingKeys = ref([])
 const tmdbCandidates = ref({})
+const selectedCandidates = ref({})
+const rowErrors = ref({})
 let fileTransferSource = null
 const fileTransferText = ref('')
 const fileTransferValue = ref(null)
@@ -38,6 +40,24 @@ function unwrap(response) {
 
 function errorMessage(errorValue, fallback) {
   return errorValue?.message || fallback
+}
+
+function rowErrorFor(row) {
+  return rowErrors.value[row.raw_title] || ''
+}
+
+function setRowError(row, msg) {
+  if (msg) {
+    rowErrors.value = { ...rowErrors.value, [row.raw_title]: msg }
+  } else {
+    const next = { ...rowErrors.value }
+    delete next[row.raw_title]
+    rowErrors.value = next
+  }
+}
+
+function clearRowError(row) {
+  setRowError(row, '')
 }
 
 function hasKey(refValue, key) {
@@ -115,6 +135,8 @@ function startFileTransferProgress() {
 async function loadReview() {
   loading.value = true
   error.value = ''
+  rowErrors.value = {}
+  selectedCandidates.value = {}   
   try {
     const response = await props.api.get('plugin/CourseOrganizer/review')
     const data = unwrap(response)
@@ -150,25 +172,37 @@ async function refreshReview() {
   }
 }
 
-async function searchTmdb(row) {
+async function searchTmdb(row, silent = false) {
   if (isSaving(row) || isTmdbLoading(row)) return
   addKey(tmdbLoadingKeys, row.raw_title)
   error.value = ''
-  notice.value = ''
+  if (!silent) notice.value = ''
+  clearRowError(row)
   tmdbCandidates.value = { ...tmdbCandidates.value, [row.raw_title]: [] }
+  const sel = { ...selectedCandidates.value }
+  delete sel[row.raw_title]
+  selectedCandidates.value = sel
   try {
     const response = await props.api.post('plugin/CourseOrganizer/review/tmdb/search', {
       raw_title: row.raw_title,
       revision: row.revision,
+      search_name: (row.final_title && row.final_title.trim()) || row.raw_title,
     })
     const data = unwrap(response)
     const candidates = Array.isArray(data?.items) ? data.items : []
     tmdbCandidates.value = { ...tmdbCandidates.value, [row.raw_title]: candidates }
-    notice.value = data?.message || '已找到 TMDB 候选'
+    if (!silent) notice.value = data?.message || '已找到 TMDB 候选'
   } catch (searchError) {
-    error.value = errorMessage(searchError, '搜索 TMDB 候选失败，请刷新后重试')
+    if (!silent) setRowError(row, errorMessage(searchError, '搜索 TMDB 候选失败，请刷新后重试'))
   } finally {
     removeKey(tmdbLoadingKeys, row.raw_title)
+  }
+}
+
+async function autoSearchAll() {
+  const todo = items.value.filter(item => !item.source_pending)
+  for (const item of todo) {
+    await searchTmdb(item, true)
   }
 }
 
@@ -177,23 +211,27 @@ async function associateTmdb(row, candidate) {
   addKey(savingKeys, row.raw_title)
   error.value = ''
   notice.value = ''
+  clearRowError(row)
   try {
     const response = await props.api.post('plugin/CourseOrganizer/review/tmdb/associate', {
       raw_title: row.raw_title,
       revision: row.revision,
       candidate_key: candidate.candidate_key,
+      search_name: (row.final_title && row.final_title.trim()) || row.raw_title,
     })
     const data = unwrap(response)
-    tmdbCandidates.value = { ...tmdbCandidates.value, [row.raw_title]: [] }
+    // 记录选中的候选 key，让匹配下拉保持显示所选；并保留候选列表供展示
+    selectedCandidates.value = { ...selectedCandidates.value, [row.raw_title]: candidate.candidate_key }
     notice.value = data?.final_title
       ? `已关联 TMDB：${data.final_title}`
       : (data?.message || '已保存 TMDB 关联')
     const updated = getUpdatedRow(row.raw_title, data)
     if (updated) {
+      // 用返回的最新行替换：建议名称将更新为所选 TMDB 的标题
       items.value = replaceRow(row.raw_title, updated)
     }
   } catch (associateError) {
-    error.value = errorMessage(associateError, '保存 TMDB 关联失败，请刷新后重试')
+    setRowError(row, errorMessage(associateError, '保存 TMDB 关联失败，请刷新后重试'))
   } finally {
     removeKey(savingKeys, row.raw_title)
   }
@@ -202,16 +240,13 @@ async function associateTmdb(row, candidate) {
 async function saveReview(row, action) {
   if (isSaving(row) || isTmdbLoading(row)) return
   if (action === 'confirm' && organizingKey.value) return
-  if (action === 'confirm' && row.association_required) {
-    error.value = '请先按名称搜索并关联 TMDB，再确认整理'
-    return
-  }
   if (action === 'confirm' && (!row.final_title || !row.target_library)) {
-    error.value = '请填写建议名称并选择目标媒体库'
+    setRowError(row, '请填写建议名称并选择目标媒体库')
     return
   }
   error.value = ''
   notice.value = ''
+  clearRowError(row)
   const payload = {
     raw_title: row.raw_title,
     revision: row.revision,
@@ -242,10 +277,10 @@ async function saveReview(row, action) {
       }
     }
   } catch (saveError) {
-    error.value = errorMessage(
+    setRowError(row, errorMessage(
       saveError,
       action === 'confirm' ? '单条整理失败，记录已保留，请重试' : '保存人工决定失败，请刷新后重试',
-    )
+    ))
   } finally {
     if (action === 'confirm') {
       stopFileTransferProgress()
@@ -314,7 +349,7 @@ function hasLibrary(row) {
 }
 
 function canConfirm(row) {
-  return !row.source_pending && hasLibrary(row) && !row.association_required
+  return !row.source_pending && hasLibrary(row)
 }
 
 function isSourcePending(row) {
@@ -340,7 +375,27 @@ function tmdbCandidatesFor(row) {
   return tmdbCandidates.value[row.raw_title] || []
 }
 
-onMounted(loadReview)
+function tmdbCandidateItems(row) {
+  return tmdbCandidatesFor(row).map(c => ({
+    ...c,
+    title: `${c.title}${c.year ? `（${c.year}）` : ''} · ${c.label || c.media_type}`,
+  }))
+}
+
+function selectedCandidateFor(row) {
+  return selectedCandidates.value[row.raw_title] || null
+}
+
+function findCandidate(row, key) {
+  return tmdbCandidatesFor(row).find(c => c.candidate_key === key) || null
+}
+
+onMounted(async () => {
+  await loadReview()
+  if (Array.isArray(items.value) && items.value.length) {
+    autoSearchAll()
+  }
+})
 onUnmounted(stopFileTransferProgress)
 
 defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
@@ -423,7 +478,6 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
             <th scope="col">原始名称</th>
             <th scope="col">建议名称（可改）</th>
             <th scope="col">目标媒体库</th>
-            <th scope="col">目标位置（只读）</th>
             <th scope="col">状态</th>
             <th scope="col" class="text-right">操作</th>
           </tr>
@@ -432,12 +486,6 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
           <tr v-for="row in items" :key="row.raw_title">
             <td class="course-review-name">{{ row.raw_title }}</td>
             <td class="course-review-edit-cell">
-              <div class="d-flex align-center ga-2 mb-2">
-                <VChip size="small" variant="tonal" color="primary">
-                  {{ row.recognition_source_label || '本地' }}
-                </VChip>
-                <span class="text-caption text-medium-emphasis">识别来源</span>
-              </div>
               <VTextField
                 v-model="row.final_title"
                 :aria-label="`建议名称：${row.raw_title}`"
@@ -446,6 +494,7 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
                 variant="outlined"
                 autocomplete="off"
                 :disabled="isSaving(row) || isOrganizing(row)"
+                placeholder="建议名称（可修改）"
               />
               <VProgressLinear
                 v-if="isOrganizing(row)"
@@ -474,46 +523,22 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
               >
                 按名称搜索 TMDB
               </VBtn>
-              <div class="text-caption text-medium-emphasis mt-1">按当前目录名称搜索，无需输入 TMDB ID</div>
-              <VAlert
-                v-if="isSourcePending(row)"
-                type="info"
-                density="compact"
-                variant="tonal"
-                class="mt-2"
-                role="status"
-              >
-                源目录暂不稳定，无法执行搜索、关联或整理，请稍后点击刷新重试
-              </VAlert>
-              <VAlert
-                v-else-if="row.association_required"
-                type="warning"
-                density="compact"
-                variant="tonal"
-                class="mt-2"
-              >
-                整理前需先关联可靠媒体信息
-              </VAlert>
-              <VSheet
+              <div class="text-caption text-medium-emphasis mt-1">自动查找，或按上方建议名称(可改)搜索</div>
+              <VSelect
                 v-if="tmdbCandidatesFor(row).length"
-                border
-                rounded
-                class="course-tmdb-candidates mt-2 pa-2"
-              >
-                <div class="text-caption text-medium-emphasis mb-1">请选择匹配的 TMDB 作品</div>
-                <VBtn
-                  v-for="candidate in tmdbCandidatesFor(row)"
-                  :key="candidate.candidate_key"
-                  block
-                  class="course-tmdb-candidate mb-1"
-                  variant="text"
-                  :disabled="isSaving(row) || isTmdbLoading(row) || isOrganizing(row)"
-                  @click="associateTmdb(row, candidate)"
-                >
-                  {{ candidate.title }}<span v-if="candidate.year">（{{ candidate.year }}）</span>
-                  · {{ candidate.label || candidate.media_type }}
-                </VBtn>
-              </VSheet>
+                :model-value="selectedCandidateFor(row)"
+                @update:model-value="(v) => { const c = findCandidate(row, v); if (c) associateTmdb(row, c) }"
+                :items="tmdbCandidateItems(row)"
+                item-title="title"
+                item-value="candidate_key"
+                hide-details
+                density="compact"
+                variant="outlined"
+                label="选择匹配的 TMDB 作品"
+                class="mt-1"
+                :disabled="isSaving(row) || isTmdbLoading(row) || isOrganizing(row)"
+                :aria-label="`选择 TMDB 候选：${row.raw_title}`"
+              />
             </td>
             <td class="course-review-library-cell">
               <VSelect
@@ -527,9 +552,6 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
                 variant="outlined"
                 :disabled="isSaving(row) || isOrganizing(row)"
               />
-            </td>
-            <td class="course-review-path" :title="targetPath(row)">
-              {{ targetPath(row) }}
             </td>
             <td>
               <VChip
@@ -584,6 +606,18 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
               >
                 重新确认
               </VBtn>
+              <VAlert
+                v-if="rowErrorFor(row)"
+                type="error"
+                density="compact"
+                variant="tonal"
+                class="mt-2 text-left"
+                role="alert"
+                :aria-label="`操作提示：${row.raw_title}`"
+                @click.stop
+              >
+                {{ rowErrorFor(row) }}
+              </VAlert>
             </td>
           </tr>
         </tbody>
@@ -594,12 +628,6 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
       <VCard v-for="row in items" :key="`card-${row.raw_title}`" border variant="outlined" class="course-review-card">
           <VCardTitle class="text-subtitle-1 text-break">{{ row.raw_title }}</VCardTitle>
           <VCardText>
-          <div class="d-flex align-center ga-2 mb-2">
-            <VChip size="small" variant="tonal" color="primary">
-            {{ row.recognition_source_label || '本地' }}
-            </VChip>
-            <span class="text-caption text-medium-emphasis">识别来源</span>
-          </div>
             <VTextField
             v-model="row.final_title"
             label="建议名称"
@@ -646,28 +674,23 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
             >
             按名称搜索 TMDB
           </VBtn>
-          <div class="text-caption text-medium-emphasis mt-n2 mb-3">按当前目录名称搜索，无需输入 TMDB ID</div>
-          <VSheet
+            <div class="text-caption text-medium-emphasis mb-1">自动查找，或按上方建议名称(可改)搜索</div>
+            <VSelect
             v-if="tmdbCandidatesFor(row).length"
-            border
-            rounded
-            class="course-tmdb-candidates mb-3 pa-2"
-          >
-            <div class="text-caption text-medium-emphasis mb-1">请选择匹配的 TMDB 作品</div>
-            <VBtn
-            v-for="candidate in tmdbCandidatesFor(row)"
-            :key="candidate.candidate_key"
-            block
-            class="course-tmdb-candidate mb-1"
-            variant="text"
+            :model-value="selectedCandidateFor(row)"
+            @update:model-value="(v) => { const c = findCandidate(row, v); if (c) associateTmdb(row, c) }"
+            :items="tmdbCandidateItems(row)"
+            item-title="title"
+            item-value="candidate_key"
+            hide-details
+            density="compact"
+            variant="outlined"
+            label="选择匹配的 TMDB 作品"
+            class="mb-3"
             :disabled="isSaving(row) || isTmdbLoading(row) || isOrganizing(row)"
-            @click="associateTmdb(row, candidate)"
-            >
-            {{ candidate.title }}<span v-if="candidate.year">（{{ candidate.year }}）</span>
-            · {{ candidate.label || candidate.media_type }}
-            </VBtn>
-          </VSheet>
-          <VSelect
+            :aria-label="`选择 TMDB 候选：${row.raw_title}`"
+            />
+            <VSelect
             v-model="row.target_library"
             :items="libraries"
             item-title="title"
@@ -678,19 +701,6 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
             density="comfortable"
             :disabled="isSaving(row) || isOrganizing(row)"
             />
-          <VAlert
-            v-if="isSourcePending(row)"
-            type="info"
-            density="compact"
-            variant="tonal"
-            class="mb-2"
-            role="status"
-          >
-            源目录暂不稳定，无法执行搜索、关联或整理，请稍后点击刷新重试
-          </VAlert>
-          <div class="text-body-2 text-medium-emphasis text-break mb-3" :title="targetPath(row)">
-            目标位置：{{ targetPath(row) }}
-          </div>
           <div class="d-flex flex-wrap align-center ga-2">
             <VChip size="small" variant="tonal">{{ libraryLabel(row) }}</VChip>
             <VChip size="small" variant="tonal" :color="statusChipColor(row)">
@@ -729,6 +739,17 @@ defineExpose({ loadReview, items, loading, savingKeys, tmdbCandidates })
             重新确认
             </VBtn>
           </div>
+          <VAlert
+            v-if="rowErrorFor(row)"
+            type="error"
+            density="compact"
+            variant="tonal"
+            class="mt-2"
+            role="alert"
+            :aria-label="`操作提示：${row.raw_title}`"
+          >
+            {{ rowErrorFor(row) }}
+          </VAlert>
           </VCardText>
       </VCard>
     </div>

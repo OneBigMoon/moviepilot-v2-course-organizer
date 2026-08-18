@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import re
+import shutil
 import sys
 import threading
 import time
@@ -252,6 +253,27 @@ class _MoviePilotNativeAdapter:
                 self._rename_local.context = previous
 
 
+def _link_files_recursive(source: str, dest: str) -> None:
+    """递归地把源目录的内容硬链（优先）或复制到目标目录；用于 hardlink/softlink 搬运。"""
+    dest = os.path.abspath(dest)
+    os.makedirs(dest, exist_ok=True)
+    for root, dirs, files in os.walk(source):
+        rel = os.path.relpath(root, source)
+        target_dir = dest if rel == "." else os.path.join(dest, rel)
+        os.makedirs(target_dir, exist_ok=True)
+        for name in files:
+            src_file = os.path.join(root, name)
+            dst_file = os.path.join(target_dir, name)
+            linked = False
+            try:
+                os.link(src_file, dst_file)
+                linked = True
+            except OSError:
+                linked = False
+            if not linked:
+                shutil.copy2(src_file, dst_file)
+
+
 def _coerce_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, str):
         lower = value.strip().lower()
@@ -268,11 +290,11 @@ _CN_SEASON_RE = re.compile(r"第\s*([0-9零一二三四五六七八九十]+)\s*�
 
 
 class CourseOrganizer(_PluginBase):
-    plugin_name = "课程自动整理"
+    plugin_name = "按文件夹分类整理"
     plugin_config_prefix = "courseorganizer_"
     auth_level = 1
     plugin_order = 90
-    plugin_version = "1.5.15"
+    plugin_version = "1.6.8"
     plugin_desc = "稳定后识别、分类并整理到电视剧、电影或儿童媒体库"
     plugin_author = "OpenAI"
     plugin_icon = "icons/courseorganizer.svg"
@@ -1905,11 +1927,9 @@ class CourseOrganizer(_PluginBase):
                     media_source = str(current.get("_media_source", "")).strip().lower()
                     media_id = str(current.get("_media_id", "")).strip()
                     media_type = str(current.get("_media_type", "unknown")).strip().lower()
-                if media_source not in {"themoviedb", "douban"} or not media_id:
-                    return self._review_response(
-                        False,
-                        message="请先按名称搜索并关联 TMDB，再确认整理",
-                    )
+                # 允许"未关联可靠媒体 ID 也手动整理"：有 ID 用之，无 ID 时由
+                # _apply_manual_decision_locked 走 MoviePilot 文件识别/按标题整理路径。
+                # 这是用户明确要求的"无论搜索结果如何都能保存并整理"。
             else:
                 final_title = ""
                 target_library = ""
@@ -2128,13 +2148,12 @@ class CourseOrganizer(_PluginBase):
         if self._manual_binding(decision) != expected_binding:
             return "failed"
         identity = self._confirmed_media_identity(course_name)
-        if identity is None:
-            self._logger.warning(
-                "CourseOrganizer[event=native_transfer_rejected] item_course_repr=%s reason=missing_media_identity",
-                ascii(course_name),
-            )
-            return "failed"
-        media_source, media_id, _recognized_media_type = identity
+        if identity is not None:
+            media_source, media_id, _recognized_media_type = identity
+        else:
+            media_source, media_id = "", ""
+        # 原生"识别+整理"只对可靠的 TMDB/豆瓣 身份有效；课程等本地/空身份走直接搬移。
+        native_valid = media_source in {"themoviedb", "douban"} and bool(media_id)
 
         directory_context = self._moviepilot_directory_context()
         rule = directory_context.get("selected", {}).get(decision.target_library)
@@ -2150,6 +2169,18 @@ class CourseOrganizer(_PluginBase):
                 ascii(course_name),
             )
             return "failed"
+
+        # 无可靠媒体 ID（课程等不在 TMDB 上的条目）：绕过 MoviePilot 的媒体识别，
+        # 直接按标题把源目录搬到"用户选择的目标媒体库"。
+        if not native_valid:
+            self._logger.info(
+                "CourseOrganizer[event=direct_transfer_started] item_course_repr=%s target_library=%s",
+                ascii(course_name),
+                decision.target_library,
+            )
+            return self._apply_direct_transfer(
+                course_name, course_path, expected_binding, decision, rule
+            )
 
         adapter = self._get_native_adapter()
         if adapter is None:
@@ -2249,6 +2280,155 @@ class CourseOrganizer(_PluginBase):
         return "success"
 
     @staticmethod
+    def _direct_safe_name(final_title: str) -> Optional[str]:
+        """把用户最终名称转成安全的目录名：去路径分隔符/控制符/前导点，长度受限。"""
+        if not isinstance(final_title, str):
+            return None
+        name = final_title.strip()
+        for ch in ("/", "\\", "\x00"):
+            name = name.replace(ch, "")
+        name = name.lstrip(".").strip()
+        name = re.sub(r"[\u0001-\u001f\u007f]", "", name)
+        name = name.strip()
+        if not name or name in {".", ".."}:
+            return None
+        name = name[:120]
+        return name
+
+    def _apply_direct_transfer(
+        self,
+        course_name: str,
+        course_path: str,
+        expected_binding: Dict[str, Any],
+        decision: naming.ManualOverride,
+        rule: Dict[str, Any],
+    ) -> str:
+        """无媒体 ID 时，按标题直接把源目录搬到目标媒体库（绕过 MoviePilot 媒体识别）。
+
+        配合目录规则的搬运方式（move/copy/hardlink 等）。失败时不消费决定，保留记录可重试。
+        """
+        source = os.path.realpath(os.path.abspath(str(course_path if isinstance(course_path, str) else "")))
+        if not source or not os.path.isdir(source):
+            self._logger.warning(
+                "CourseOrganizer[event=direct_transfer_failed] item_course_repr=%s reason=source_missing",
+                ascii(course_name),
+            )
+            return "no_media"
+        incoming = str(rule.get("download_path") or "")
+        if incoming and not self._is_within_realpath(incoming, source):
+            self._logger.warning(
+                "CourseOrganizer[event=direct_transfer_failed] item_course_repr=%s reason=source_outside_incoming",
+                ascii(course_name),
+            )
+            return "failed"
+        final_name = self._direct_safe_name(str(getattr(decision, "value", "") or course_name))
+        if not final_name:
+            self._logger.warning(
+                "CourseOrganizer[event=direct_transfer_failed] item_course_repr=%s reason=invalid_final_name",
+                ascii(course_name),
+            )
+            return "failed"
+        target_root = os.path.realpath(os.path.abspath(str(rule.get("path") or "")))
+        if not target_root or not os.path.isdir(target_root) or not os.access(target_root, os.W_OK):
+            self._logger.warning(
+                "CourseOrganizer[event=direct_transfer_failed] item_course_repr=%s reason=target_root_missing",
+                ascii(course_name),
+            )
+            return "failed"
+        sub = ""
+        if rule.get("library_category_folder") and decision.target_library == "children":
+            sub = os.path.join(sub, "儿童课程")
+        elif rule.get("library_type_folder"):
+            sub = os.path.join(sub, "电视剧" if decision.target_library != "movie" else "电影")
+        dest_dir = os.path.realpath(os.path.join(target_root, sub, final_name))
+        if not self._is_within_realpath(os.path.join(target_root, sub), dest_dir):
+            self._logger.warning(
+                "CourseOrganizer[event=direct_transfer_failed] item_course_repr=%s reason=target_escape",
+                ascii(course_name),
+            )
+            return "failed"
+        if os.path.exists(dest_dir):
+            self._logger.warning(
+                "CourseOrganizer[event=direct_transfer_failed] item_course_repr=%s reason=target_exists",
+                ascii(course_name),
+            )
+            return "failed"
+
+        transfer_type = str(rule.get("transfer_type") or "").strip().lower()
+        try:
+            if transfer_type in {"", "move"} or transfer_type.startswith("rclone_move"):
+                try:
+                    shutil.move(source, dest_dir)
+                except shutil.Error:
+                    shutil.copytree(source, dest_dir)
+                    self._safe_remove_tree(source)
+                except OSError:
+                    shutil.copytree(source, dest_dir)
+                    self._safe_remove_tree(source)
+            elif transfer_type in {"copy", "rclone_copy"} or transfer_type.startswith("copy"):
+                shutil.copytree(source, dest_dir)
+            elif "hardlink" in transfer_type or transfer_type in {"softlink", "soft_link"}:
+                try:
+                    _link_files_recursive(source, dest_dir)
+                except Exception:
+                    self._logger.warning(
+                        "CourseOrganizer[event=direct_transfer_fallback] item_course_repr=%s",
+                        ascii(course_name),
+                    )
+                    shutil.copytree(source, dest_dir)
+            else:
+                # 未知搬运方式回退到移动
+                shutil.move(source, dest_dir)
+        except Exception as exc:
+            if os.path.exists(dest_dir) and not transfer_type.startswith("move"):
+                self._safe_remove_tree(dest_dir)
+            self._logger.error(
+                "CourseOrganizer[event=direct_transfer_failed] item_course_repr=%s phase=transfer reason=%s",
+                ascii(course_name),
+                exc.__class__.__name__,
+            )
+            return "failed"
+
+        if not os.path.exists(dest_dir):
+            self._logger.error(
+                "CourseOrganizer[event=direct_transfer_failed] item_course_repr=%s phase=verify",
+                ascii(course_name),
+            )
+            return "failed"
+        self._logger.info(
+            "CourseOrganizer[event=direct_transfer_ok] item_course_repr=%s path=%s",
+            ascii(course_name),
+            dest_dir,
+        )
+        if not self._consume_manual_decision(course_name, expected_binding):
+            self._logger.error(
+                "CourseOrganizer[event=moved_but_record_incomplete] item_course_repr=%s phase=direct_manual_decision",
+                ascii(course_name),
+            )
+            return "partial"
+        try:
+            completed = self._get_resolver().mark_completed(course_name)
+        except Exception:
+            completed = False
+        if not completed:
+            self._logger.error(
+                "CourseOrganizer[event=moved_but_record_incomplete] item_course_repr=%s phase=direct_completed_at",
+                ascii(course_name),
+            )
+            return "partial"
+        return "success"
+
+    @staticmethod
+    def _safe_remove_tree(path: str) -> None:
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    @staticmethod
     def _tmdb_candidate_response(candidate: naming.MetadataCandidate) -> Dict[str, Any]:
         media_type = candidate.media_type if candidate.media_type in {"tv", "movie"} else "unknown"
         media_label = {"tv": "电视剧", "movie": "电影"}.get(media_type, "未知类型")
@@ -2292,8 +2472,10 @@ class CourseOrganizer(_PluginBase):
         config = self._get_config()
         if config.get("naming_mode") == "off":
             return self._review_response(False, message="请先启用命名预览后再搜索 TMDB")
+        # 优先使用用户修改后的新名称进行搜索；未提供时回退到原始目录名。
+        search_name = str(payload.get("search_name") or raw_title) if isinstance(payload, dict) else str(raw_title)
         result = self._get_resolver().search_tmdb_candidates(
-            str(raw_title), NamingConfig.sanitize(config), limit=10
+            search_name, NamingConfig.sanitize(config), limit=10
         )
         candidates = [
             candidate
@@ -2338,7 +2520,7 @@ class CourseOrganizer(_PluginBase):
         if config.get("naming_mode") == "off":
             return self._review_response(False, message="请先启用命名预览后再关联 TMDB")
         result = self._get_resolver().search_tmdb_candidates(
-            str(raw_title), NamingConfig.sanitize(config), limit=10
+            str(payload.get("search_name") or raw_title), NamingConfig.sanitize(config), limit=10
         )
         candidate = next(
             (

@@ -301,13 +301,12 @@ def test_vue_build_filter_preserves_course_component_overrides():
     assert ".course-review-page :deep(.v-btn)" in page_source
     assert "min-height: 44px" in page_source
     assert "min-width: 44px" in page_source
-    assert "recognition_source_label" in page_source
     assert "review/tmdb/search" in page_source
     assert "review/tmdb/associate" in page_source
     assert "review/refresh" in page_source
     assert "async function refreshReview" in page_source
     assert "按名称搜索 TMDB" in page_source
-    assert "无需输入 TMDB ID" in page_source
+    assert "自动查找，或按上方建议名称(可改)搜索" in page_source
     assert "raw_title: row.raw_title" in page_source
     assert "const savingKeys = ref([])" in page_source
     assert "const tmdbLoadingKeys = ref([])" in page_source
