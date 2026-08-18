@@ -1665,7 +1665,7 @@ def test_confirm_allows_no_media_identity_direct_transfer():
         children_output=native.config["children_output"],
     )
     (Path(native.config["incoming"]) / "课程").mkdir(parents=True, exist_ok=True)
-    (Path(native.config["incoming"]) / "课程" / "1.mkv").write_bytes(b"media")
+    (Path(native.config["incoming"]) / "课程" / "S01E01.mp4").write_bytes(b"media")
     row = _data_item(organizer.get_review(), "课程")
 
     response = organizer.save_review(
@@ -1679,9 +1679,9 @@ def test_confirm_allows_no_media_identity_direct_transfer():
     )
 
     assert _success(response)
-    # 直接搬移：源目录被移到目标媒体库的最终名称下，源目录不再存在
-    dest_dir = Path(native.config["tv_output"]) / "课程 (2024)"
-    assert (dest_dir / "1.mkv").exists()
+    # 直接搬移 + 重组成标准剧集结构：源目录被移到目标媒体库/最终名称/Season 1/S01E01.mp4，源目录消失
+    dest_season1 = Path(native.config["tv_output"]) / "课程 (2024)" / "Season 1"
+    assert (dest_season1 / "S01E01.mp4").exists()
     assert not (Path(native.config["incoming"]) / "课程").exists()
     # 未走 MoviePilot native 识别路径
     assert native.calls == []

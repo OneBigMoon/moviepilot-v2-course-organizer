@@ -17,7 +17,7 @@ def test_plugin_version_matches_package_metadata():
     package_path = Path(__file__).parents[1] / "package.v2.json"
     package = json.loads(package_path.read_text(encoding="utf-8"))
 
-    assert CourseOrganizer.plugin_version == "1.6.8"
+    assert CourseOrganizer.plugin_version == "1.6.9"
     assert package["CourseOrganizer"]["version"] == CourseOrganizer.plugin_version
 
 

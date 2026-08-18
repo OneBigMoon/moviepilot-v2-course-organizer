@@ -253,6 +253,30 @@ class _MoviePilotNativeAdapter:
                 self._rename_local.context = previous
 
 
+def _cn_num(token: str) -> int:
+    """把中文数字（一二三…十/百）或阿拉伯数字字符串转成 int。"""
+    t = str(token or "").strip()
+    if not t:
+        return 1
+    if t.isdigit():
+        return int(t)
+    digits = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9}
+    if t in digits:
+        return digits[t]
+    if t == "十":
+        return 10
+    # 十几 / 几十
+    if len(t) == 2:
+        if t[0] == "十":
+            return 10 + digits.get(t[1], 0)
+        return digits.get(t[0], 0) * 10 + digits.get(t[1], 0)
+    try:
+        return int(t)
+    except (TypeError, ValueError):
+        return 1
+
+
 def _link_files_recursive(source: str, dest: str) -> None:
     """递归地把源目录的内容硬链（优先）或复制到目标目录；用于 hardlink/softlink 搬运。"""
     dest = os.path.abspath(dest)
@@ -294,7 +318,7 @@ class CourseOrganizer(_PluginBase):
     plugin_config_prefix = "courseorganizer_"
     auth_level = 1
     plugin_order = 90
-    plugin_version = "1.6.8"
+    plugin_version = "1.6.9"
     plugin_desc = "稳定后识别、分类并整理到电视剧、电影或儿童媒体库"
     plugin_author = "OpenAI"
     plugin_icon = "icons/courseorganizer.svg"
@@ -2400,6 +2424,15 @@ class CourseOrganizer(_PluginBase):
             ascii(course_name),
             dest_dir,
         )
+        # 搬移后把媒体文件重组为标准剧集结构：Season N/ 文件夹 + S01E01 命名；多集合并文件保留。
+        try:
+            self._normalize_episode_tree(dest_dir)
+        except Exception as exc:
+            self._logger.error(
+                "CourseOrganizer[event=direct_transfer_reorg_failed] item_course_repr=%s reason=%s",
+                ascii(course_name),
+                exc.__class__.__name__,
+            )
         if not self._consume_manual_decision(course_name, expected_binding):
             self._logger.error(
                 "CourseOrganizer[event=moved_but_record_incomplete] item_course_repr=%s phase=direct_manual_decision",
@@ -2427,6 +2460,91 @@ class CourseOrganizer(_PluginBase):
                 os.remove(path)
         except Exception:
             pass
+
+    @staticmethod
+    def _parse_season_episode(name: str) -> Optional[Tuple[int, int, Optional[int]]]:
+        """从文件名解析 (季, 起始集, 结束集)。结束集可为 None。"""
+        s = str(name)
+        # S01E01 或 S01E01-02 / S01E01-E002（英文）
+        m = re.search(r"(?i)\bs(\d{1,2})\s*e(\d{1,3})(?:[\s\-_.]*e?(\d{1,3}))?\b", s)
+        if m:
+            season = int(m.group(1))
+            start = int(m.group(2))
+            end = int(m.group(3)) if m.group(3) is not None else None
+            if end is not None and end <= start:
+                end = None
+            return season, start, end
+        # 第1季第1集 / 第一季 第一集（中文）
+        cn = re.search(r"第\s*([0-9零一二三四五六七八九十百]+)\s*季.*?第\s*([0-9零一二三四五六七八九十百]+)\s*集", s)
+        if cn:
+            season = _cn_num(cn.group(1))
+            start = _cn_num(cn.group(2))
+            return season, start, None
+        return None
+
+    @classmethod
+    def _folder_season(cls, path: str) -> Optional[int]:
+        """从父目录名判断季（Season 1 / 第1季）。"""
+        base = os.path.basename(os.path.normpath(path))
+        m = re.search(r"(?i)season\s*(\d{1,2})\b", base)
+        if m:
+            return int(m.group(1))
+        cn = re.search(r"第\s*([0-9零一二三四五六七八九十百]+)\s*季", base)
+        if cn:
+            return _cn_num(cn.group(1))
+        return None
+
+    def _normalize_episode_tree(self, dest_dir: str) -> None:
+        """把目标目录下的媒体文件重组为 Season N/S01E01 标准结构；多集合并文件保留为 S01E01-E02。"""
+        files = []
+        for root, _, fnames in os.walk(dest_dir):
+            rel_root = os.path.relpath(root, dest_dir)
+            folder_season = self._folder_season(root)
+            for fn in fnames:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in self.MEDIA_EXTENSIONS:
+                    continue
+                files.append((root, rel_root, fn, folder_season))
+        seen_targets = set()
+        for root, rel_root, fn, folder_season in files:
+            stem = os.path.splitext(fn)[0]
+            parsed = self._parse_season_episode(stem)
+            season = parsed[0] if parsed else folder_season
+            if parsed is None and season is None:
+                # 无法识别季/集，保持原样（放一层 Season 1 或就在根）
+                season = 1
+                start = None
+            else:
+                start = parsed[1] if parsed else None
+            end = parsed[2] if parsed and parsed[2] is not None else None
+            season_dir = os.path.join(dest_dir, "Season {}".format(season))
+            os.makedirs(season_dir, exist_ok=True)
+            new_name = stem
+            if start is not None:
+                new_name = "S{:02d}E{:02d}".format(season, start)
+                if end is not None:
+                    new_name += "-E{:02d}".format(end)
+            new_name += os.path.splitext(fn)[1]
+            target = os.path.join(season_dir, new_name)
+            n = 1
+            base_t = target
+            while target in seen_targets or os.path.exists(target):
+                target = os.path.join(season_dir, "{}-{}".format(os.path.splitext(base_t)[0], n) + os.path.splitext(base_t)[1])
+                n += 1
+            src = os.path.join(root, fn)
+            if os.path.abspath(src) != os.path.abspath(target):
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.move(src, target)
+            seen_targets.add(target)
+        # 清理空目录
+        for root, dirs, fnames in os.walk(dest_dir, topdown=False):
+            if root == dest_dir:
+                continue
+            if not os.listdir(root):
+                try:
+                    os.rmdir(root)
+                except OSError:
+                    pass
 
     @staticmethod
     def _tmdb_candidate_response(candidate: naming.MetadataCandidate) -> Dict[str, Any]:
