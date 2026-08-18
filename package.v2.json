@@ -22,6 +22,7 @@
       "v1.6.2": "搜索词自动回退；操作失败提示显示在对应行",
       "v1.6.1": "插件更名为按文件夹分类整理",
       "v1.6.0": "支持无媒体ID手动整理；搜索按修改后新名称；进入页面自动查找候选"
-    }
+    },
+    "repo": "https://github.com/OneBigMoon/moviepilot-v2-course-organizer"
   }
 }
