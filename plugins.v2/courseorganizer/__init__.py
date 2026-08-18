@@ -320,7 +320,7 @@ class CourseOrganizer(_PluginBase):
     plugin_order = 90
     plugin_version = "1.7.0"
     plugin_desc = "稳定后识别、分类并整理到电视剧、电影或儿童媒体库"
-    plugin_author = "OpenAI"
+    plugin_author = "OneBigMoon"
     plugin_icon = "icons/courseorganizer.svg"
 
     MEDIA_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".m4v", ".m4a"}
