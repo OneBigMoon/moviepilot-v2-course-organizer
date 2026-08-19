@@ -4,7 +4,7 @@
 
 - **插件 ID**：`CourseOrganizer`
 - **作者**：[OneBigMoon](https://github.com/OneBigMoon)
-- **版本**：`1.7.0`（V2 插件）
+- **版本**：`1.7.5`（V2 插件）
 - **官方插件市场 PR**：[jxxghp/MoviePilot-Plugins#1148](https://github.com/jxxghp/MoviePilot-Plugins/pull/1148)
 - **仓库**：<https://github.com/OneBigMoon/moviepilot-v2-course-organizer>
 
@@ -58,6 +58,9 @@ MoviePilot 的"整理"必须先把文件识别成某部**有 TMDB/豆瓣 ID 的�
 
 ## 版本历史
 
+- **v1.7.5** 修复“项目主页”打开空白页；“目录设置”改为直接跳转 MoviePilot 系统设置
+- **v1.7.4** 支持多选批量整理，任务按顺序执行，单项失败不会中断后续队列
+- **v1.7.3** 精简复核页，复用 MoviePilot 媒体类别与目录规则，新增规则摘要、使用说明和安全恢复处理
 - **v1.7.0** 修复课程文件在 Season 结构中未改名：支持"10.标题"式前置序号识别并重命名为 `S01E10`
 - **v1.6.9** 课程直接搬移后重组为标准剧集结构 `Season N/S01E01`，多集合并文件保留
 - **v1.6.8** 选定 TMDB 后匹配下拉显示所选结果，建议名称跟随 TMDB 标题

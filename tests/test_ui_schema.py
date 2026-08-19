@@ -106,7 +106,7 @@ def test_form_is_lightweight_and_keeps_moviepilot_directory_settings_authoritati
             "naming_mode",
         }
     )
-    assert "MoviePilot 设置 → 存储 & 目录" in rendered
+    assert "目录和整理规则沿用 MoviePilot 系统设置" in rendered
     settings_button = next(
         component
         for component in components
@@ -116,6 +116,14 @@ def test_form_is_lightweight_and_keeps_moviepilot_directory_settings_authoritati
     assert settings_button["text"] == "打开 MoviePilot 存储与目录设置"
     assert defaults["incoming"] == before["incoming"]
     assert defaults["naming_mode"] == before["naming_mode"]
+
+
+def test_plugin_exposes_project_url_for_local_install_fallback():
+    assert CourseOrganizer.author_url == (
+        "https://github.com/OneBigMoon/moviepilot-v2-course-organizer"
+    )
+
+
 def test_review_reads_whitelisted_moviepilot_directory_rules(monkeypatch):
     organizer = CourseOrganizer(config=_config())
     _set_rows_resolver(organizer, [])
@@ -142,6 +150,7 @@ def test_review_reads_whitelisted_moviepilot_directory_rules(monkeypatch):
             "storage": "local",
             "library_storage": "local",
             "transfer_type": "copy",
+            "renaming": True,
         },
         {
             "name": "儿童课程",
@@ -151,6 +160,8 @@ def test_review_reads_whitelisted_moviepilot_directory_rules(monkeypatch):
             "storage": "local",
             "library_storage": "local",
             "transfer_type": "link",
+            "renaming": True,
+            "media_category": "儿童",
         },
     ]
     monkeypatch.setattr(
@@ -164,6 +175,8 @@ def test_review_reads_whitelisted_moviepilot_directory_rules(monkeypatch):
     assert data["rules_ready"] is True
     assert data["rules_message"] == ""
     assert data["monitoring_enabled"] is True
+    assert data["monitoring_rules"] == ["电视剧"]
+    assert data["incoming_path"] == "/media/incoming"
     assert data["settings_url"] == "#/setting"
     assert [(item["value"], item["path"]) for item in data["libraries"]] == [
         ("tv", "/media/tv"),
@@ -198,6 +211,47 @@ def test_directory_rule_path_courses_does_not_make_tv_rule_children():
             "media_type": "电视剧",
         }
     ) == "tv"
+
+
+def test_directory_rule_prefers_moviepilot_media_category_over_alias_fallback():
+    organizer = CourseOrganizer(config=_config())
+
+    assert organizer._directory_rule_library(
+        {
+            "name": "学习资源",
+            "media_type": "电视剧",
+            "media_category": "儿童",
+        }
+    ) == "children"
+    assert organizer._directory_rule_library(
+        {
+            "name": "亲子电影",
+            "media_type": "电影",
+            "media_category": "儿童",
+        }
+    ) == "movie"
+
+
+def test_review_requires_moviepilot_smart_renaming(monkeypatch):
+    organizer = CourseOrganizer(config=_config())
+    _set_rows_resolver(organizer, [])
+    rules = [
+        {
+            "name": "电影",
+            "download_path": "/media/incoming",
+            "library_path": "/media/movies",
+            "media_type": "电影",
+            "storage": "local",
+            "library_storage": "local",
+            "renaming": False,
+        }
+    ]
+    monkeypatch.setattr(organizer, "_load_moviepilot_directory_rules", lambda: (rules, ""))
+
+    data = organizer.get_review()["data"]
+
+    assert data["rules_ready"] is False
+    assert "电影规则未开启智能重命名" in data["rules_message"]
 
 
 def test_review_hides_preview_row_when_source_directory_is_missing(monkeypatch):
@@ -296,6 +350,9 @@ def test_vue_build_filter_preserves_course_component_overrides():
     config_source = (plugin_root / "src" / "components" / "Config.vue").read_text(
         encoding="utf-8"
     )
+    assert "window.location.assign(target)" in page_source
+    assert '@click.stop="openMoviePilotSettings"' in page_source
+    assert "window.location.assign('#/setting')" in config_source
 
     assert "!rule.selector.includes('.course-')" in vite_config
     assert ".course-review-page :deep(.v-btn)" in page_source
@@ -305,8 +362,8 @@ def test_vue_build_filter_preserves_course_component_overrides():
     assert "review/tmdb/associate" in page_source
     assert "review/refresh" in page_source
     assert "async function refreshReview" in page_source
-    assert "按名称搜索 TMDB" in page_source
-    assert "自动查找，或按上方建议名称(可改)搜索" in page_source
+    assert "重新搜索 TMDB" in page_source
+    assert "未找到匹配，可修改名称后重试" in page_source
     assert "raw_title: row.raw_title" in page_source
     assert "const savingKeys = ref([])" in page_source
     assert "const tmdbLoadingKeys = ref([])" in page_source
@@ -319,7 +376,9 @@ def test_vue_build_filter_preserves_course_component_overrides():
     assert page_source.count('aria-live="polite"') >= 2
     assert "已关联 TMDB：${data.final_title}" in page_source
     assert "[row.raw_title]: []" in page_source
-    assert page_source.count("保存并整理") >= 2
+    assert page_source.count("确认并整理") >= 2
+    assert "saveReview(row, 'restore')" in page_source
+    assert "当前一次只能整理一个项目，完成后可继续下一项" in page_source
     assert "整理中" in page_source
     assert "const organizingKey = ref('')" in page_source
     assert "const confirmingKey = ref('')" not in page_source
@@ -348,20 +407,23 @@ def test_vue_build_filter_preserves_course_component_overrides():
     assert page_source.count('v-if="isOrganizing(row)"') >= 4
     assert page_source.count(':loading="isOrganizing(row)"') >= 2
     assert "hasOrganizingValue()" in page_source
-    assert page_source.count(':disabled="Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"') >= 2
-    assert (
-        page_source.count(
-            ':disabled="isSourcePending(row) || Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"'
-        )
-        >= 2
-    )
+    assert page_source.count(
+        ':disabled="batchRunning || Boolean(organizingKey) || !canConfirm(row) || isTmdbLoading(row)"'
+    ) >= 2
+    assert page_source.count(
+        ':disabled="batchRunning || isSourcePending(row) || isSaving(row) || isOrganizing(row)"'
+    ) >= 2
+    assert "async function organizeSelected" in page_source
+    assert "await saveReview(row, 'confirm', { queued: true })" in page_source
+    assert "失败项目已保留" in page_source
+    assert "批量整理" in page_source
     assert "items.value = items.value.filter(item => item.raw_title !== row.raw_title)" in page_source
     assert "notice.value = '整理完成'" in page_source
     assert "文件移动完成，正在写入整理记录…" in page_source
-    assert "MoviePilot「设置 → 存储 &amp; 目录」" in page_source
+    assert "设置 → 存储 &amp; 目录" in page_source
     assert "directoryRules" in page_source
     assert "monitoringEnabled" in page_source
-    assert "MoviePilot「设置 → 存储 &amp; 目录」" in config_source
+    assert "沿用 MoviePilot 系统设置" in config_source
     for duplicate_model in (
         "incoming",
         "tv_output",

@@ -304,6 +304,32 @@ def test_timestamp_only_refresh_does_not_block_save_review():
     assert latest["status_label"] == "已跳过"
 
 
+def test_restore_ignored_row_only_returns_it_to_pending():
+    organizer = _organizer([_row()])
+    row = _data_item(organizer.get_review(), "课程")
+    ignored = organizer.save_review(
+        {"raw_title": "课程", "revision": row["revision"], "action": "ignore"}
+    )
+    assert _success(ignored)
+    skipped = _data_item(organizer.get_review(), "课程")
+
+    restored = organizer.save_review(
+        {
+            "raw_title": "课程",
+            "revision": skipped["revision"],
+            "action": "restore",
+        }
+    )
+
+    assert _success(restored)
+    assert _message(restored) == "已恢复为待处理"
+    latest = _data_item(organizer.get_review(), "课程")
+    assert latest["status"] == "review"
+    assert latest["status_label"] == "需要确认"
+    assert organizer.get_data(CourseOrganizer.MANUAL_DECISIONS_KEY)["items"] == {}
+    assert (Path(organizer._get_config()["incoming"]) / "课程").exists()
+
+
 @pytest.mark.parametrize(
     "raw_title",
     ["黑冰（2001）高清修复版 未删减", "全角ＡＢＣ课程", "课程  名称", "  首尾空格  "],
