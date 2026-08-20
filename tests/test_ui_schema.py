@@ -123,6 +123,7 @@ def test_plugin_exposes_project_homepage_for_local_install_fallback():
         "https://github.com/OneBigMoon/moviepilot-v2-course-organizer"
     )
     assert CourseOrganizer.author_url == expected
+    assert CourseOrganizer.project_url == expected
     assert CourseOrganizer.plugin_repo == expected
 
 
@@ -425,6 +426,7 @@ def test_vue_build_filter_preserves_course_component_overrides():
     assert "设置 → 存储 &amp; 目录" in page_source
     assert "directoryRules" in page_source
     assert "monitoringEnabled" in page_source
+    assert 'v-if="monitoringEnabled && hasItems"' in page_source
     assert "沿用 MoviePilot 系统设置" in config_source
     for duplicate_model in (
         "incoming",
