@@ -55,6 +55,7 @@ function saveConfig() {
 }
 
 function openMoviePilotSettings() {
+  emit('close');
   window.location.assign('#/setting');
 }
 
@@ -222,6 +223,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Config = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-d68d4aec"]]);
+const Config = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-760c7a3b"]]);
 
 export { Config as default };

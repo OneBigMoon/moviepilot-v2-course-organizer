@@ -352,9 +352,9 @@ def test_vue_build_filter_preserves_course_component_overrides():
     config_source = (plugin_root / "src" / "components" / "Config.vue").read_text(
         encoding="utf-8"
     )
-    assert "window.location.assign(target)" in page_source
+    assert "emit('close')\n  window.location.assign(target)" in page_source
     assert '@click.stop="openMoviePilotSettings"' in page_source
-    assert "window.location.assign('#/setting')" in config_source
+    assert "emit('close')\n  window.location.assign('#/setting')" in config_source
 
     assert "!rule.selector.includes('.course-')" in vite_config
     assert ".course-review-page :deep(.v-btn)" in page_source

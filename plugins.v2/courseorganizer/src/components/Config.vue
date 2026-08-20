@@ -40,6 +40,7 @@ function saveConfig() {
 }
 
 function openMoviePilotSettings() {
+  emit('close')
   window.location.assign('#/setting')
 }
 </script>

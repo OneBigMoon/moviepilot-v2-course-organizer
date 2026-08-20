@@ -144,6 +144,7 @@ function errorMessage(errorValue, fallback) {
 
 function openMoviePilotSettings() {
   const target = settingsUrl.value || '#/setting';
+  emit('close');
   window.location.assign(target);
 }
 
@@ -1424,6 +1425,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Page = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-bd9d3feb"]]);
+const Page = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-550e7d5d"]]);
 
 export { Page as default };

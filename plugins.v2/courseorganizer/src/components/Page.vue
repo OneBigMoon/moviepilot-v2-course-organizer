@@ -78,6 +78,7 @@ function errorMessage(errorValue, fallback) {
 
 function openMoviePilotSettings() {
   const target = settingsUrl.value || '#/setting'
+  emit('close')
   window.location.assign(target)
 }
 
