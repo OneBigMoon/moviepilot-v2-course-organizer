@@ -318,10 +318,12 @@ class CourseOrganizer(_PluginBase):
     plugin_config_prefix = "courseorganizer_"
     auth_level = 1
     plugin_order = 90
-    plugin_version = "1.7.2"
+    plugin_version = "1.7.6"
     plugin_desc = "稳定后识别、分类并整理到电视剧、电影或儿童媒体库"
     plugin_author = "OneBigMoon"
+    author_url = "https://github.com/OneBigMoon/moviepilot-v2-course-organizer"
     plugin_icon = "icons/courseorganizer.svg"
+    plugin_repo = "https://github.com/OneBigMoon/moviepilot-v2-course-organizer"
 
     MEDIA_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".m4v", ".m4a"}
     SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".vtt"}
@@ -676,21 +678,27 @@ class CourseOrganizer(_PluginBase):
     @classmethod
     def _directory_rule_library(cls, rule: Any) -> str:
         name = str(cls._directory_rule_value(rule, "name", "") or "")
-        # The MoviePilot directory alias is the user's explicit library
-        # declaration.  Do not infer a child library from an arbitrary path
-        # segment such as ``courses``; paths are deployment-specific and can
-        # be used by an ordinary TV rule.
-        descriptor = name.lower()
-        if any(
-            token in descriptor
-            for token in ("儿童", "少儿", "幼儿", "课程", "早教", "宝宝", "亲子")
-        ):
-            return "children"
         media_type = str(
             cls._directory_rule_value(rule, "media_type", "") or ""
         ).strip()
         if media_type == "电影":
             return "movie"
+        category = str(
+            cls._directory_rule_value(
+                rule,
+                "media_category",
+                cls._directory_rule_value(rule, "category", ""),
+            )
+            or ""
+        ).strip()
+        # MoviePilot already has a media-category field. Prefer that system
+        # declaration and retain alias matching only for older directory data.
+        descriptor = f"{category} {name}".lower()
+        if any(
+            token in descriptor
+            for token in ("儿童", "少儿", "幼儿", "课程", "早教", "宝宝", "亲子")
+        ):
+            return "children"
         if media_type == "电视剧":
             return "tv"
         return ""
@@ -728,10 +736,19 @@ class CourseOrganizer(_PluginBase):
             rule_alias = str(
                 self._directory_rule_value(rule, "name", "") or labels[library]
             )
+            media_category = str(
+                self._directory_rule_value(
+                    rule,
+                    "media_category",
+                    self._directory_rule_value(rule, "category", ""),
+                )
+                or ""
+            ).strip()
             summary = {
                 "title": rule_alias,
                 "value": library,
                 "name": rule_alias,
+                "media_category": media_category,
                 "download_path": download_path,
                 "path": library_path,
                 "monitor_type": str(
@@ -760,6 +777,8 @@ class CourseOrganizer(_PluginBase):
             }
             grouped[library].append(summary)
             summaries.append(summary)
+            if not summary["renaming"]:
+                issues.append(f"{rule_alias}规则未开启智能重命名")
 
         selected: Dict[str, Dict[str, Any]] = {}
         for library, candidates in grouped.items():
@@ -791,6 +810,9 @@ class CourseOrganizer(_PluginBase):
             "message": "；".join(dict.fromkeys(issues)),
             "settings_url": "#/setting",
             "monitoring_enabled": any(bool(item["monitor_type"]) for item in summaries),
+            "monitoring_rules": [
+                item["title"] for item in summaries if item["monitor_type"]
+            ],
         }
 
     def _review_path_config(
@@ -1755,6 +1777,8 @@ class CourseOrganizer(_PluginBase):
                 "rules_ready": directory_context["ready"],
                 "rules_message": directory_context["message"],
                 "monitoring_enabled": directory_context["monitoring_enabled"],
+                "monitoring_rules": directory_context["monitoring_rules"],
+                "incoming_path": directory_context["incoming"],
                 "settings_url": directory_context["settings_url"],
             },
         )
@@ -1899,6 +1923,35 @@ class CourseOrganizer(_PluginBase):
                 return False
             return True
 
+    def _restore_ignored_decision(
+        self, raw_title: str, expected_binding: Dict[str, Any]
+    ) -> bool:
+        """Remove only a matching ignore decision; never apply or move media."""
+        with self._review_data_lock:
+            try:
+                existing = self.get_data(self.MANUAL_DECISIONS_KEY)
+            except Exception:
+                return False
+            decision = self._manual_decision_for(raw_title, existing)
+            if (
+                decision is None
+                or decision.action != "ignore"
+                or self._manual_binding(decision) != expected_binding
+                or not isinstance(existing, dict)
+                or not isinstance(existing.get("items"), dict)
+            ):
+                return False
+            items = dict(existing["items"])
+            items.pop(raw_title, None)
+            try:
+                result = self.save_data(
+                    self.MANUAL_DECISIONS_KEY,
+                    {"schema": self.MANUAL_DECISIONS_SCHEMA, "items": items},
+                )
+            except Exception:
+                return False
+            return result is not False and self._manual_decision_consumed(raw_title)
+
     def save_review(self, payload: Optional[Dict[str, Any]] = Body(default=None)) -> Any:
         if not isinstance(payload, dict):
             return self._review_response(False, message="请求参数无效")
@@ -1910,7 +1963,7 @@ class CourseOrganizer(_PluginBase):
         if not isinstance(revision, str) or not revision:
             return self._review_response(False, message="缺少预览版本")
         action = str(payload.get("action", "")).strip().lower()
-        if action not in {"confirm", "ignore"}:
+        if action not in {"confirm", "ignore", "restore"}:
             return self._review_response(False, message="操作无效")
 
         with self._thread_lock:
@@ -1923,6 +1976,23 @@ class CourseOrganizer(_PluginBase):
             expected_binding = current.get("_source_binding")
             if not isinstance(expected_binding, dict):
                 return self._review_response(False, message="源目录已不存在或已变化，请刷新预览")
+
+            if action == "restore":
+                if current.get("status") != "ignore" or not self._restore_ignored_decision(
+                    raw_title, expected_binding
+                ):
+                    return self._review_response(False, message="恢复待处理状态失败，请刷新后重试")
+                self._resolver = None
+                self._resolver_signature = ()
+                latest = next(
+                    (
+                        item
+                        for item in self._review_rows(raw_title=raw_title)
+                        if item.get("raw_title") == raw_title
+                    ),
+                    None,
+                )
+                return self._review_response(True, latest or {}, "已恢复为待处理")
 
             final_title = payload.get("final_title", "")
             target_library = str(payload.get("target_library", "")).strip().lower()
@@ -3034,6 +3104,8 @@ class CourseOrganizer(_PluginBase):
                     "model": "naming_clear_cache_once",
                     "label": "一次性清空识别缓存",
                     "aria-label": "一次性清空识别缓存",
+                    "hint": "下次运行时清除旧识别结果；执行后自动复位",
+                    "persistent-hint": True,
                     "color": "error",
                 },
             },
@@ -3043,7 +3115,7 @@ class CourseOrganizer(_PluginBase):
                 "component": "VForm",
                 "props": {
                     "class": "courseorganizer-form",
-                    "aria-label": "课程识别设置",
+                    "aria-label": "整理识别设置",
                 },
                 "content": [
                     {
@@ -3053,10 +3125,7 @@ class CourseOrganizer(_PluginBase):
                             "variant": "tonal",
                             "class": "mb-3",
                         },
-                        "text": (
-                            "来源目录、目标媒体库、搬运方式、重命名、刮削和通知统一使用 "
-                            "MoviePilot 设置 → 存储 & 目录；本插件不重复保存这些配置。"
-                        ),
+                        "text": "目录和整理规则沿用 MoviePilot 系统设置，本插件只保留识别选项。",
                     },
                     {
                         "component": "VBtn",
