@@ -118,11 +118,12 @@ def test_form_is_lightweight_and_keeps_moviepilot_directory_settings_authoritati
     assert defaults["naming_mode"] == before["naming_mode"]
 
 
-def test_plugin_exposes_author_homepage_for_local_install_fallback():
-    assert CourseOrganizer.author_url == "https://github.com/OneBigMoon"
-    assert CourseOrganizer.plugin_repo == (
+def test_plugin_exposes_project_homepage_for_local_install_fallback():
+    expected = (
         "https://github.com/OneBigMoon/moviepilot-v2-course-organizer"
     )
+    assert CourseOrganizer.author_url == expected
+    assert CourseOrganizer.plugin_repo == expected
 
 
 def test_review_reads_whitelisted_moviepilot_directory_rules(monkeypatch):
