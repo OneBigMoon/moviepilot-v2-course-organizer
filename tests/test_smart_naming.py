@@ -1322,6 +1322,14 @@ def test_naming_config_instances_are_sanitized_like_mapping_input():
     assert config.manual_overrides == ""
 
 
+def test_naming_config_normalizes_regional_tmdb_source_aliases():
+    config = NamingConfig.sanitize(
+        NamingConfig(mode="apply", sources=("hk", "tw", "sg"))
+    )
+
+    assert config.sources == ("themoviedb",)
+
+
 def test_search_only_provider_still_honors_configured_source_allowlist():
     class SearchOnlyProvider:
         def __init__(self):
@@ -2695,6 +2703,42 @@ def test_parse_manual_ignore_without_colon_is_valid():
     assert result.errors == ()
     assert len(result.overrides) == 1
     assert result.overrides[0].action == "ignore"
+
+
+def test_manual_douban_candidate_never_uses_tmdb_id_suffix():
+    raw_title = "豆瓣课程"
+    candidate = naming.MetadataCandidate(
+        key="douban:123:tv",
+        source="douban",
+        media_id="123",
+        media_type="tv",
+        title="豆瓣课程",
+        year=2020,
+    )
+    store = {
+        "naming_identity_v1": {
+            raw_title: {"cached_candidates": [candidate.to_dict()]}
+        }
+    }
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda key, default=None: store.get(key, default),
+        save_data=lambda key, value: store.__setitem__(key, value),
+        provider=object(),
+    )
+
+    decision = resolver_obj.resolve(
+        raw_title,
+        naming.DirectoryHints(media_count=1, seasons=(1,), episodic=True),
+        NamingConfig(
+            mode="apply",
+            append_tmdb_id=True,
+            manual_overrides=f"{raw_title} => candidate:{candidate.key}",
+        ),
+    )
+
+    assert decision.status == "auto_external"
+    assert decision.final_root == "豆瓣课程 (2020)"
+    assert "tmdbid" not in decision.final_root
 
 
 def test_query_override_integration_records_cache_and_blocks_move(tmp_path):
