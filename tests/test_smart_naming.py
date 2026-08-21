@@ -1085,6 +1085,50 @@ def test_identity_cache_expires_automatic_results_but_keeps_manual_choices():
     )
 
 
+def test_query_override_does_not_renew_automatic_identity_ttl():
+    raw_title = "海底小纵队中文版（1-8季）视频1080p"
+    store = {
+        "naming_identity_v1": {
+            raw_title: {
+                "search_key": "automatic-key",
+                "status": "auto_external",
+                "updated": 100,
+                "reason_codes": [],
+            }
+        }
+    }
+
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda key, default=None: store.get(key, default),
+        save_data=lambda key, value: store.__setitem__(key, value),
+        provider=object(),
+    )
+    query_hints = naming.parse_title(raw_title, manual_query="海底小纵队")
+    candidate = naming.MetadataCandidate(
+        key="themoviedb:32623:tv",
+        source="themoviedb",
+        media_id="32623",
+        media_type="tv",
+        title="海底小纵队",
+        year=2010,
+    )
+
+    resolver_obj._save_query_override(
+        raw_title=raw_title,
+        now=1000,
+        query_hints=query_hints,
+        query="海底小纵队",
+        search_key="manual-query-key",
+        candidates=(candidate,),
+        config=NamingConfig(mode="apply"),
+    )
+
+    saved = store["naming_identity_v1"][raw_title]
+    assert saved["updated"] == 100
+    assert saved["last_query_updated"] == 1000
+    assert saved["last_query_candidates"] == [candidate.to_dict()]
+
+
 def test_naming_config_sanitize_handles_non_string_source_sequence():
     config = NamingConfig.sanitize(
         {
