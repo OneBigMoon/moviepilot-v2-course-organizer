@@ -885,6 +885,25 @@ def test_preview_does_not_move_files(tmp_path):
     assert not any(output.iterdir())
 
 
+def test_preview_preserves_exact_filesystem_title_when_nfkc_changes_punctuation(tmp_path):
+    incoming = tmp_path / "incoming"
+    output = tmp_path / "output"
+    incoming.mkdir()
+    output.mkdir()
+    course_name = "少儿数学启蒙动画，《数学荒岛历险记》1-3季合集"
+    course = incoming / course_name
+    course.mkdir()
+    (course / "lesson.mp4").write_bytes(b"x")
+    organizer = _fixture_course_organizer(tmp_path, mode="preview")
+
+    assert organizer._process_course(course_name, str(course), str(output)) is False
+    assert organizer._process_course(course_name, str(course), str(output)) is False
+
+    rows = organizer._get_resolver().preview_rows()
+    assert any(row["raw_title"] == course_name for row in rows)
+    assert not any(row["raw_title"] == course_name.replace("，", ",") for row in rows)
+
+
 def test_apply_uses_expected_tumble_leaf_root_and_filename(tmp_path, monkeypatch):
     incoming = tmp_path / "incoming"
     output = tmp_path / "output"

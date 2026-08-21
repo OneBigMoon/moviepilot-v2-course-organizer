@@ -4,7 +4,7 @@
 
 - **插件 ID**：`CourseOrganizer`
 - **作者**：[OneBigMoon](https://github.com/OneBigMoon)
-- **版本**：`1.7.8`（V2 插件）
+- **版本**：`1.7.9`（V2 插件）
 - **官方插件市场 PR**：[jxxghp/MoviePilot-Plugins#1148](https://github.com/jxxghp/MoviePilot-Plugins/pull/1148)
 - **仓库**：<https://github.com/OneBigMoon/moviepilot-v2-course-organizer>
 
@@ -58,6 +58,7 @@ MoviePilot 的"整理"必须先把文件识别成某部**有 TMDB/豆瓣 ID 的�
 
 ## 版本历史
 
+- **v1.7.9** 修复全角标点目录名被搜索归一化后无法绑定真实来源目录的问题
 - **v1.7.8** 声明独立项目主页；空目录时隐藏无关的自动监控警告
 - **v1.7.7** 等待插件弹窗关闭后再进入目录设置，避免遮挡系统设置页面
 - **v1.7.6** 进入 MoviePilot 目录设置前关闭插件弹窗
