@@ -78,6 +78,14 @@ def test_parse_title_normalizes_nfkc_whitespace_and_limits_queries():
     assert len(hints.query_candidates) <= 3
 
 
+@pytest.mark.parametrize(
+    "value",
+    ("Spider-Man", "Spider Man", "[Spider-Man]", "【 Spider Man 】"),
+)
+def test_normalize_title_removes_spacing_hyphen_and_brackets(value):
+    assert naming.normalize_title(value) == "spiderman"
+
+
 def test_parse_title_with_chinese_season_range():
     hints = naming.parse_title("课程《少年》第一季")
     assert 1 in hints.season_hints
@@ -876,6 +884,162 @@ def test_search_tmdb_candidates_falls_back_when_ai_query_fails():
     assert provider.calls[0][0] == ("海底小纵队", "first_clause")
     cached = next(iter(store[SmartNamingResolver.AI_QUERY_CACHE_KEY].values()))
     assert cached["failed"] is True
+
+
+@pytest.mark.parametrize(
+    ("policy", "status", "blocked_reason", "allowed"),
+    (
+        ("local", "local_fallback", "", True),
+        ("hold", "manual_review", "manual_review", False),
+    ),
+)
+def test_resolver_handles_successful_empty_search_by_uncertain_policy(
+    policy, status, blocked_reason, allowed
+):
+    class EmptyProvider:
+        def resolve_sources(self, requested):
+            return tuple(requested)
+
+        def search(self, _queries, sources):
+            return ProviderSearchResult((), (), tuple(sources), all_failed=False)
+
+    store = {}
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda key, default=None: store.get(key, default),
+        save_data=lambda key, value: store.__setitem__(key, value),
+        provider=EmptyProvider(),
+        clock=lambda: 400,
+    )
+    decision = resolver_obj.resolve(
+        "没有候选的课程",
+        naming.DirectoryHints(media_count=1, seasons=(), episodic=False),
+        NamingConfig(
+            mode="preview",
+            sources=("themoviedb",),
+            uncertain_policy=policy,
+        ),
+    )
+
+    assert decision.status == status
+    assert decision.blocked_reason == blocked_reason
+    assert decision.allowed_to_move is allowed
+
+
+def test_search_tmdb_candidates_does_not_reuse_identity_for_changed_ai_query():
+    raw_title = "海底小纵队中文版（1-8季）视频1080p"
+    stale_candidate = naming.MetadataCandidate(
+        key="themoviedb:old:tv",
+        source="themoviedb",
+        media_id="old",
+        media_type="tv",
+        title="旧候选",
+    )
+    fresh_candidate = naming.MetadataCandidate(
+        key="themoviedb:new:tv",
+        source="themoviedb",
+        media_id="new",
+        media_type="tv",
+        title="海底小纵队",
+    )
+    store = {
+        "naming_identity_v1": {
+            raw_title: {
+                "raw_title": raw_title,
+                "updated": 500,
+                "search_key": "old-ai-query-key",
+                "cached_candidates": [stale_candidate.to_dict()],
+                "source_errors": [],
+            }
+        }
+    }
+
+    class FreshProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def resolve_sources(self, requested):
+            return tuple(requested)
+
+        def search(self, _queries, sources):
+            self.calls += 1
+            return ProviderSearchResult(
+                (fresh_candidate,), (), tuple(sources), all_failed=False
+            )
+
+    class NewQueryReviewer:
+        def __init__(self):
+            self.calls = 0
+
+        def suggest_query(self, _raw, _hints):
+            self.calls += 1
+            return "新版海底小纵队"
+
+    provider = FreshProvider()
+    reviewer = NewQueryReviewer()
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda key, default=None: store.get(key, default),
+        save_data=lambda key, value: store.__setitem__(key, value),
+        provider=provider,
+        ai_reviewer=reviewer,
+        clock=lambda: 500,
+    )
+
+    result = resolver_obj.search_tmdb_candidates(
+        raw_title,
+        NamingConfig(mode="preview", sources=("themoviedb",), ai_review=True),
+    )
+
+    assert reviewer.calls == 1
+    assert provider.calls == 1
+    assert tuple(candidate.media_id for candidate in result.candidates) == ("new",)
+
+
+def test_search_tmdb_candidates_keeps_ai_query_and_short_fallback_when_full(
+    monkeypatch,
+):
+    raw_title = "复杂课程目录"
+    hints = naming.TitleHints(
+        raw_title=raw_title,
+        local_title="复杂课程高清修复版",
+        year=None,
+        season_hints=(),
+        query_candidates=(
+            naming.QueryCandidate("AI 优先", "ai_query"),
+            naming.QueryCandidate("复杂课程高清修复版", "first_clause"),
+            naming.QueryCandidate("第三候选", "book_title"),
+        ),
+        reason_codes=(),
+    )
+    monkeypatch.setattr(naming, "parse_title", lambda _value: hints)
+
+    class SpyProvider:
+        def __init__(self):
+            self.queries = ()
+
+        def resolve_sources(self, requested):
+            return tuple(requested)
+
+        def search(self, queries, sources):
+            self.queries = tuple((item.text, item.origin) for item in queries)
+            return ProviderSearchResult((), (), tuple(sources), all_failed=False)
+
+    provider = SpyProvider()
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda _key, default=None: default,
+        save_data=lambda _key, _value: None,
+        provider=provider,
+        clock=lambda: 600,
+    )
+    resolver_obj.search_tmdb_candidates(
+        raw_title,
+        NamingConfig(mode="preview", sources=("themoviedb",), ai_review=False),
+    )
+
+    assert provider.queries == (
+        ("AI 优先", "ai_query"),
+        ("复杂课程高清修复版", "first_clause"),
+        ("复杂课程", "fallback"),
+    )
 
 
 def test_resolver_forces_review_to_local_when_ai_disabled_and_no_uncertain_review(monkeypatch):
