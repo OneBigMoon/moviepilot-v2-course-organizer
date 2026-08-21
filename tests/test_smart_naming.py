@@ -3542,6 +3542,50 @@ def test_naming_mode_off_calls_no_provider_no_preview_no_cache(tmp_path):
     assert "naming_identity_v1" not in organizer._data
 
 
+@pytest.mark.parametrize(
+    "override",
+    (
+        "课程A => query:课程A",
+        "课程A => candidate:themoviedb:1:tv",
+    ),
+)
+def test_naming_mode_off_ignores_historical_external_overrides(override):
+    class OffProvider:
+        def resolve_sources(self, _requested):
+            raise AssertionError("disabled naming must not resolve providers")
+
+        def search(self, _queries, _sources):
+            raise AssertionError("disabled naming must not search providers")
+
+    candidate = naming.MetadataCandidate(
+        key="themoviedb:1:tv",
+        source="themoviedb",
+        media_id="1",
+        media_type="tv",
+        title="课程A",
+    )
+    store = {
+        "naming_identity_v1": {
+            "课程A": {"cached_candidates": [candidate.to_dict()]}
+        }
+    }
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda key, default=None: store.get(key, default),
+        save_data=lambda key, value: store.__setitem__(key, value),
+        provider=OffProvider(),
+    )
+
+    decision = resolver_obj.resolve(
+        "课程A",
+        naming.DirectoryHints(media_count=1, seasons=(1,), episodic=True),
+        NamingConfig(mode="OFF", manual_overrides=override),
+    )
+
+    assert decision.status == "local_fallback"
+    assert decision.source == ""
+    assert "naming_search_cache_v1" not in store
+
+
 def test_ai_review_preserves_original_hints_selected_score_and_english_title(monkeypatch, tmp_path):
     raw_title = "飘零叶 Tumble Leaf"
 
