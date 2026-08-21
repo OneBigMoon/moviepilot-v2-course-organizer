@@ -785,7 +785,7 @@ def test_search_cache_with_future_timestamp_is_not_reused():
     assert tuple(candidate.media_id for candidate in result.candidates) == ("fresh",)
 
 
-def test_preview_pruning_uses_row_timestamp():
+def test_preview_pruning_keeps_latest_write_after_clock_rollback():
     store = {}
     current = {"now": 0}
     resolver_obj = SmartNamingResolver(
@@ -796,7 +796,7 @@ def test_preview_pruning_uses_row_timestamp():
     )
     resolver_obj.PREVIEW_MAX = 2
 
-    for raw_title, timestamp in (("较早", 200), ("最新", 300), ("最旧", 100)):
+    for raw_title, timestamp in (("较早写入", 200), ("随后写入", 300), ("回拨后写入", 100)):
         current["now"] = timestamp
         resolver_obj.record_decision(
             NamingDecision(
@@ -808,7 +808,112 @@ def test_preview_pruning_uses_row_timestamp():
             )
         )
 
-    assert {row["raw_title"] for row in resolver_obj.preview_rows()} == {"较早", "最新"}
+    assert {row["raw_title"] for row in resolver_obj.preview_rows()} == {
+        "随后写入",
+        "回拨后写入",
+    }
+
+
+def test_preview_refresh_moves_row_to_latest_write_position():
+    store = {}
+    current = {"now": 100}
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda key, default=None: store.get(key, default),
+        save_data=lambda key, value: store.__setitem__(key, value),
+        provider=object(),
+        clock=lambda: current["now"],
+    )
+    resolver_obj.PREVIEW_MAX = 2
+
+    def record(raw_title):
+        resolver_obj.record_decision(
+            NamingDecision(
+                status="local_fallback",
+                raw_title=raw_title,
+                local_title=raw_title,
+                final_root=raw_title,
+                final_prefix=raw_title,
+            )
+        )
+
+    record("A")
+    current["now"] = 200
+    record("B")
+    current["now"] = 50
+    record("A")
+    current["now"] = 40
+    record("C")
+
+    assert [row["raw_title"] for row in resolver_obj.preview_rows()] == ["A", "C"]
+
+
+def test_dict_cache_pruning_keeps_latest_insertion_after_clock_rollback():
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda _key, default=None: default,
+        save_data=lambda _key, _value: None,
+        provider=object(),
+    )
+    cache = {
+        "first": {"updated": 300},
+        "second": {"updated": 200},
+        "rollback_new": {"updated": 100},
+    }
+
+    resolver_obj._prune_cache(cache, 2)
+
+    assert tuple(cache) == ("second", "rollback_new")
+
+
+def test_identity_cache_expires_automatic_results_but_keeps_manual_choices():
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda _key, default=None: default,
+        save_data=lambda _key, _value: None,
+        provider=object(),
+    )
+    automatic = {
+        "search_key": "key",
+        "status": "auto_external",
+        "updated": 100,
+        "reason_codes": [],
+    }
+
+    assert resolver_obj._identity_reusable(
+        automatic,
+        "key",
+        100 + resolver_obj.SEARCH_TTL_SECONDS - 1,
+    )
+    assert not resolver_obj._identity_reusable(
+        automatic,
+        "key",
+        100 + resolver_obj.SEARCH_TTL_SECONDS,
+    )
+    assert not resolver_obj._identity_reusable(automatic, "key", 99)
+
+    manual_candidate = dict(
+        automatic,
+        updated=1,
+        reason_codes=["manual_candidate"],
+    )
+    assert resolver_obj._identity_reusable(
+        manual_candidate,
+        "key",
+        100 + resolver_obj.SEARCH_TTL_SECONDS * 10,
+    )
+
+    manual_local = {
+        "search_key": "key",
+        "status": "local_fallback",
+        "updated": 1,
+        "reason_codes": ["manual_local"],
+        "manual_local": True,
+        "uncertain_policy": "local",
+    }
+    assert resolver_obj._identity_reusable(
+        manual_local,
+        "key",
+        100 + resolver_obj.SEARCH_TTL_SECONDS * 10,
+        has_matching_local_override=True,
+    )
 
 
 def test_naming_config_sanitize_handles_non_string_source_sequence():
@@ -1451,7 +1556,10 @@ def test_apply_keeps_weak_bear_child_local_fallback_with_top_candidate(tmp_path)
     assert (output / course_name / "Season 1" / f"{course_name} - S01E001.mp4").read_bytes() == b"x"
 
 
-@pytest.mark.parametrize("raw_confidence", [math.nan, math.inf, -0.1, 1.1, 0.84, "nan"])
+@pytest.mark.parametrize(
+    "raw_confidence",
+    [math.nan, math.inf, -0.1, 1.1, 0.84, "nan", "0.95", True],
+)
 def test_ai_reviewer_rejects_invalid_confidence(raw_confidence):
     candidate = naming.MetadataCandidate(
         key="themoviedb:65047:tv",
@@ -1480,6 +1588,48 @@ def test_ai_reviewer_rejects_invalid_confidence(raw_confidence):
     )
     assert result.accepted is False
     assert result.decision == "local"
+
+
+@pytest.mark.parametrize("raw_confidence", ["0.95", True])
+def test_library_classifier_rejects_coerced_confidence_types(raw_confidence):
+    classifier = providers.MoviePilotLibraryClassifier(
+        invoke_fn=lambda _payload: {
+            "library": "children",
+            "confidence": raw_confidence,
+            "reason_codes": ["ai"],
+        }
+    )
+
+    result = classifier.classify(
+        raw_title="儿童课程",
+        final_title="儿童课程",
+        media_type="tv",
+        episodic=True,
+    )
+
+    assert result.accepted is False
+    assert result.library == "hold"
+    assert result.error == "malformed_ai_payload"
+
+
+def test_library_classifier_accepts_integer_numeric_confidence():
+    classifier = providers.MoviePilotLibraryClassifier(
+        invoke_fn=lambda _payload: {
+            "library": "children",
+            "confidence": 1,
+            "reason_codes": ["children_audience"],
+        }
+    )
+
+    result = classifier.classify(
+        raw_title="儿童课程",
+        final_title="儿童课程",
+        media_type="tv",
+        episodic=True,
+    )
+
+    assert result.accepted is True
+    assert result.library == "children"
 
 
 def test_resolver_rejects_invalid_ai_confidence(monkeypatch):
@@ -1832,7 +1982,7 @@ def test_ai_reviewer_respects_ai_agent_disable(monkeypatch):
     assert result.accepted is False
 
 
-def test_identity_reuse_external_after_30_days_and_schema_invalidation(tmp_path):
+def test_identity_refreshes_external_after_30_days_and_schema_invalidation(tmp_path):
     class SpyProvider:
         PROVIDER_SCHEMA_VERSION = "1"
 
@@ -1886,7 +2036,7 @@ def test_identity_reuse_external_after_30_days_and_schema_invalidation(tmp_path)
     timepoints["now"] = 31 * 24 * 60 * 60
     second = resolver.resolve("飘零叶 Tumble Leaf", directory, config)
     assert second.status == "auto_external"
-    assert provider.calls == 1
+    assert provider.calls == 2
 
     third = resolver.resolve(
         "飘零叶 Tumble Leaf",
@@ -1894,17 +2044,17 @@ def test_identity_reuse_external_after_30_days_and_schema_invalidation(tmp_path)
         NamingConfig(mode="apply", auto_threshold=60),
     )
     assert third.status == "auto_external"
-    assert provider.calls == 1
+    assert provider.calls == 2
 
     provider_schema = SpyProvider.PROVIDER_SCHEMA_VERSION
     SpyProvider.PROVIDER_SCHEMA_VERSION = "2"
     fourth = resolver.resolve("飘零叶 Tumble Leaf", directory, config)
     assert fourth.status == "auto_external"
-    assert provider.calls == 2
+    assert provider.calls == 3
     SpyProvider.PROVIDER_SCHEMA_VERSION = provider_schema
 
 
-def test_identity_reuse_local_with_no_candidates_without_new_search(tmp_path):
+def test_identity_refreshes_local_with_no_candidates_after_30_days(tmp_path):
     class SpyProvider:
         def __init__(self):
             self.calls = 0
@@ -1946,7 +2096,7 @@ def test_identity_reuse_local_with_no_candidates_without_new_search(tmp_path):
     timepoints["now"] = 31 * 24 * 60 * 60
     second = resolver.resolve("课程A", directory, NamingConfig(mode="apply"))
     assert second.status == "local_fallback"
-    assert provider.calls == 1
+    assert provider.calls == 2
 
 
 def test_identity_invalidated_by_query_or_source_change():
