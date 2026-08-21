@@ -1129,6 +1129,26 @@ def test_mark_completed_rejects_permanent_false_save_without_mutating_shared_row
     assert "completed_at" not in shared_rows[0]
 
 
+def test_mark_completed_does_not_report_success_from_unsaved_reordered_copy():
+    organizer = _organizer([_row("课程"), _row("其他课程")])
+    shared_rows = organizer.get_data("naming_preview_v1")
+    original_save_data = organizer.save_data
+    attempts = []
+
+    def reject_preview_save(key, value):
+        if key == "naming_preview_v1":
+            attempts.append(value)
+            return False
+        return original_save_data(key, value)
+
+    organizer.save_data = reject_preview_save
+    resolver = organizer._build_resolver(organizer._get_config())
+
+    assert resolver.mark_completed("课程") is False
+    assert len(attempts) == 2
+    assert all("completed_at" not in row for row in shared_rows)
+
+
 def test_adjacent_rows_are_upserted_without_losing_each_other():
     organizer = _organizer([_row("课程 A"), _row("课程 B")])
     rows = _response_data(organizer.get_review())["items"]
