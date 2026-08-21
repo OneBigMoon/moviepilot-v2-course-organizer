@@ -1298,6 +1298,30 @@ def test_naming_config_sanitize_handles_non_string_source_sequence():
     assert config.sources == ("themoviedb", "douban")
 
 
+def test_naming_config_instances_are_sanitized_like_mapping_input():
+    config = NamingConfig.sanitize(
+        NamingConfig(
+            mode="OFF",
+            sources=("unsupported",),
+            auto_threshold=1,
+            min_margin=99,
+            uncertain_policy="UNKNOWN",
+            append_tmdb_id="yes",
+            ai_review="no",
+            manual_overrides=None,
+        )
+    )
+
+    assert config.mode == "off"
+    assert config.sources == ("themoviedb", "douban")
+    assert config.auto_threshold == 80
+    assert config.min_margin == 30
+    assert config.uncertain_policy == "local"
+    assert config.append_tmdb_id is True
+    assert config.ai_review is False
+    assert config.manual_overrides == ""
+
+
 def test_search_only_provider_still_honors_configured_source_allowlist():
     class SearchOnlyProvider:
         def __init__(self):
