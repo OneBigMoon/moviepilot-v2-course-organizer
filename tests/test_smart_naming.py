@@ -266,6 +266,31 @@ def test_provider_resolves_sources_and_budget():
     assert len(fake.calls) <= 6
 
 
+def test_provider_rejects_candidate_reported_by_unrequested_source():
+    provider = MoviePilotMetadataProvider(chain=object())
+    item = FakeMediaInfo(
+        "douban",
+        "65047",
+        "tv",
+        "Tumble Leaf",
+        "Tumble Leaf",
+        "",
+        (),
+        2013,
+        "65047",
+        "65047",
+        "",
+    )
+
+    candidate = provider._from_media_info(
+        item,
+        "themoviedb",
+        naming.QueryCandidate("Tumble Leaf", "manual"),
+    )
+
+    assert candidate is None
+
+
 def test_provider_marks_empty_partial_source_failure_for_short_error_ttl():
     class FailChain:
         def __init__(self):
@@ -992,6 +1017,63 @@ def test_search_cache_with_future_timestamp_is_not_reused():
     assert tuple(candidate.media_id for candidate in result.candidates) == ("fresh",)
 
 
+def test_partial_error_search_cache_uses_short_ttl_even_with_candidates():
+    stale = naming.MetadataCandidate(
+        key="themoviedb:stale:tv",
+        source="themoviedb",
+        media_id="stale",
+        media_type="tv",
+        title="旧候选",
+    )
+    fresh = naming.MetadataCandidate(
+        key="themoviedb:fresh:tv",
+        source="themoviedb",
+        media_id="fresh",
+        media_type="tv",
+        title="新候选",
+    )
+    store = {}
+
+    class Provider:
+        def __init__(self):
+            self.calls = 0
+
+        def search(self, _queries, sources):
+            self.calls += 1
+            return ProviderSearchResult((fresh,), (), tuple(sources), all_failed=False)
+
+    provider = Provider()
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda key, default=None: store.get(key, default),
+        save_data=lambda key, value: store.__setitem__(key, value),
+        provider=provider,
+    )
+    hints = naming.parse_title("缓存课程")
+    sources = ("themoviedb", "douban")
+    search_key = resolver_obj._query_hash(hints, sources)
+    store["naming_search_cache_v1"] = {
+        search_key: {
+            "updated": 100,
+            "candidates": [stale.to_dict()],
+            "errors": ["douban:temporary_failure"],
+            "attempted_sources": list(sources),
+            "all_failed": False,
+            "parser_schema": naming.PARSER_SCHEMA_VERSION,
+            "provider_schema": resolver_obj._provider_schema(),
+        }
+    }
+
+    result = resolver_obj._load_search_result(
+        search_key,
+        100 + resolver_obj.ERROR_TTL_SECONDS,
+        hints,
+        sources,
+    )
+
+    assert provider.calls == 1
+    assert tuple(candidate.media_id for candidate in result.candidates) == ("fresh",)
+
+
 def test_preview_pruning_keeps_latest_write_after_clock_rollback():
     store = {}
     current = {"now": 0}
@@ -1095,6 +1177,18 @@ def test_identity_cache_expires_automatic_results_but_keeps_manual_choices():
         100 + resolver_obj.SEARCH_TTL_SECONDS,
     )
     assert not resolver_obj._identity_reusable(automatic, "key", 99)
+
+    partial_error = dict(automatic, source_errors=["douban:temporary_failure"])
+    assert resolver_obj._identity_reusable(
+        partial_error,
+        "key",
+        100 + resolver_obj.ERROR_TTL_SECONDS - 1,
+    )
+    assert not resolver_obj._identity_reusable(
+        partial_error,
+        "key",
+        100 + resolver_obj.ERROR_TTL_SECONDS,
+    )
 
     manual_candidate = dict(
         automatic,

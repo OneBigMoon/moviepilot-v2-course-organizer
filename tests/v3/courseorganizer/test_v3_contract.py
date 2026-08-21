@@ -206,3 +206,22 @@ def test_v3_metadata_provider_rejects_legacy_id_only_items():
     )
 
     assert provider._from_media_info(legacy_item, "themoviedb", query) is None
+
+
+def test_v3_metadata_provider_rejects_unrequested_actual_source():
+    module = load_v3_courseorganizer()
+    providers = sys.modules[f"{module.__name__}.providers"]
+    provider = providers.MoviePilotMetadataProvider(chain=object())
+    query = providers.naming.QueryCandidate(text="示例", origin="local")
+    mismatched_item = SimpleNamespace(
+        title="示例",
+        type="tv",
+        media_source=SimpleNamespace(value="douban"),
+        media_id="123",
+    )
+
+    assert provider._from_media_info(
+        mismatched_item,
+        "themoviedb",
+        query,
+    ) is None
