@@ -378,7 +378,14 @@ def test_vue_build_filter_preserves_course_component_overrides():
     assert 'aria-live="polite"' in page_source
     assert page_source.count('aria-live="polite"') >= 2
     assert "已关联 TMDB：${data.final_title}" in page_source
-    assert "[row.raw_title]: []" in page_source
+    assert "row?.selected_candidate" in page_source
+    assert "row?.selected_candidate_key" in page_source
+    assert "!item.selected_candidate_key" in page_source
+    assert page_source.count("'已关联的 TMDB 作品' : '选择匹配的 TMDB 作品'") == 2
+    search_source = page_source.split("async function searchTmdb", 1)[1].split(
+        "async function autoSearchAll", 1
+    )[0]
+    assert "delete sel[row.raw_title]" not in search_source
     assert page_source.count("确认并整理") >= 2
     assert "saveReview(row, 'restore')" in page_source
     assert "当前一次只能整理一个项目，完成后可继续下一项" in page_source
