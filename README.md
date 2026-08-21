@@ -4,8 +4,8 @@
 
 - **插件 ID**：`CourseOrganizer`
 - **作者**：[OneBigMoon](https://github.com/OneBigMoon)
-- **版本**：`1.7.9`（V2 插件）
-- **官方插件市场 PR**：[jxxghp/MoviePilot-Plugins#1148](https://github.com/jxxghp/MoviePilot-Plugins/pull/1148)
+- **版本**：`1.7.12`（V2 插件；V3 为 `2.0.2`）
+- **官方插件市场 PR**：[jxxghp/MoviePilot-Plugins#1157](https://github.com/jxxghp/MoviePilot-Plugins/pull/1157)
 - **仓库**：<https://github.com/OneBigMoon/moviepilot-v2-course-organizer>
 
 ---
@@ -35,6 +35,12 @@ MoviePilot 的"整理"必须先把文件识别成某部**有 TMDB/豆瓣 ID 的�
 4. 修改建议名称、选择目标媒体库，点击"保存并整理"。
 5. 有 TMDB/豆瓣 ID → MoviePilot 原生整理；课程等无 ID → 直接搬移 + 季/集归一。
 
+## 智能助手
+
+先在 MoviePilot **设置 → 智能助手** 中配置并启用模型（如 DeepSeek），再打开插件设置中的
+**启用智能助手**。开启后，复杂目录名会先提取适合 TMDB 的搜索词，再复核候选；智能助手
+不可用时自动回退到本地规则与人工确认。
+
 ## 目录配置
 
 在 MoviePilot：**设置 → 存储 & 目录**，至少准备三条明确规则（来源可同一目录）：
@@ -58,6 +64,8 @@ MoviePilot 的"整理"必须先把文件识别成某部**有 TMDB/豆瓣 ID 的�
 
 ## 版本历史
 
+- **v1.7.12** 新增智能助手开关说明，明确需先在 MoviePilot 配置并启用模型
+- **v1.7.11** 智能助手先精简复杂目录名再搜索 TMDB，并识别 1-8 季范围
 - **v1.7.10** 重新打开或搜索后保留已关联的 TMDB 作品并默认选中
 - **v1.7.9** 修复全角标点目录名被搜索归一化后无法绑定真实来源目录的问题
 - **v1.7.8** 声明独立项目主页；空目录时隐藏无关的自动监控警告
