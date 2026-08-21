@@ -485,6 +485,32 @@ def test_sync_ai_callback_timeout_limits_daemon_workers(monkeypatch):
     gate.release()
 
 
+def test_sync_query_prompt_chain_honors_timeout(monkeypatch):
+    class SlowSyncQueryChain:
+        def invoke(self, _payload):
+            time.sleep(0.2)
+            return {"query": "海底小纵队"}
+
+    reviewer = MoviePilotAIReviewer(
+        invoke_fn=lambda _payload: None,
+        timeout_seconds=0.01,
+        max_attempts=1,
+    )
+    reviewer._invoke_fn = None
+    monkeypatch.setattr(
+        reviewer,
+        "_get_query_prompt_chain",
+        lambda: SlowSyncQueryChain(),
+    )
+    hints = naming.parse_title("海底小纵队中文版（1-8季）视频1080p")
+
+    started = time.monotonic()
+    result = reviewer.suggest_query(hints.raw_title, hints)
+
+    assert time.monotonic() - started < 0.15
+    assert result is None
+
+
 def test_ai_reviewer_suggest_query_is_structured_and_rejects_invalid_output():
     captured: list[dict[str, Any]] = []
 
@@ -1961,6 +1987,39 @@ def test_ai_reviewer_rejects_invalid_confidence(raw_confidence):
 
 
 @pytest.mark.parametrize("raw_confidence", ["0.95", True])
+def test_ai_reviewer_revalidates_unchecked_choice_instances(raw_confidence):
+    candidate = naming.MetadataCandidate(
+        key="themoviedb:65047:tv",
+        source="themoviedb",
+        media_id="65047",
+        media_type="tv",
+        title="Tumble Leaf",
+        year=2013,
+    )
+    scored = naming.ScoredCandidate(candidate=candidate, score=95, reason_codes=("x",))
+    construct = getattr(providers.AIReviewChoice, "model_construct", None)
+    if not callable(construct):
+        construct = providers.AIReviewChoice.construct
+    unchecked = construct(
+        decision="choose",
+        candidate_key=candidate.key,
+        confidence=raw_confidence,
+        reason_codes=("ai",),
+    )
+    reviewer = MoviePilotAIReviewer(invoke_fn=lambda _payload: unchecked)
+
+    result = reviewer.review(
+        "飘零叶 Tumble Leaf",
+        naming.parse_title("飘零叶 Tumble Leaf"),
+        [scored],
+        {candidate.key: 95},
+    )
+
+    assert result.accepted is False
+    assert result.error == "malformed_ai_payload"
+
+
+@pytest.mark.parametrize("raw_confidence", ["0.95", True])
 def test_library_classifier_rejects_coerced_confidence_types(raw_confidence):
     classifier = providers.MoviePilotLibraryClassifier(
         invoke_fn=lambda _payload: {
@@ -1968,6 +2027,32 @@ def test_library_classifier_rejects_coerced_confidence_types(raw_confidence):
             "confidence": raw_confidence,
             "reason_codes": ["ai"],
         }
+    )
+
+    result = classifier.classify(
+        raw_title="儿童课程",
+        final_title="儿童课程",
+        media_type="tv",
+        episodic=True,
+    )
+
+    assert result.accepted is False
+    assert result.library == "hold"
+    assert result.error == "malformed_ai_payload"
+
+
+@pytest.mark.parametrize("raw_confidence", ["0.95", True])
+def test_library_classifier_revalidates_unchecked_choice_instances(raw_confidence):
+    construct = getattr(providers.LibraryRouteChoice, "model_construct", None)
+    if not callable(construct):
+        construct = providers.LibraryRouteChoice.construct
+    unchecked = construct(
+        library="children",
+        confidence=raw_confidence,
+        reason_codes=("children_audience",),
+    )
+    classifier = providers.MoviePilotLibraryClassifier(
+        invoke_fn=lambda _payload: unchecked
     )
 
     result = classifier.classify(
