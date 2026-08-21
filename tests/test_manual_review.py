@@ -1586,9 +1586,15 @@ def test_tmdb_association_rejects_stale_cross_row_and_forged_candidates():
     assert organizer.get_data(CourseOrganizer.MANUAL_DECISIONS_KEY) is None
 
 
-def test_tmdb_association_persists_and_resolver_reuses_selected_candidate_after_restart():
+def test_tmdb_association_persists_and_resolver_reuses_selected_candidate_after_restart(tmp_path):
     provider = _TmdbProvider()
-    organizer = _organizer([_row("课程")], metadata_provider=provider, enabled=True)
+    incoming = tmp_path / "incoming"
+    organizer = _organizer(
+        [_row("课程")],
+        metadata_provider=provider,
+        enabled=True,
+        incoming=str(incoming),
+    )
     row = _data_item(organizer.get_review(), "课程")
     candidate = _response_data(
         organizer.search_tmdb({"raw_title": "课程", "revision": row["revision"]})
@@ -1604,13 +1610,23 @@ def test_tmdb_association_persists_and_resolver_reuses_selected_candidate_after_
     latest = _data_item(organizer.get_review(), "课程")
     assert latest["recognition_source_label"] == "TMDB"
     assert latest["final_title"].startswith("课程 正式名")
+    assert latest["selected_candidate_key"] == candidate["candidate_key"]
+    assert latest["selected_candidate"] == candidate
     stored = copy.deepcopy(organizer.get_data(CourseOrganizer.MANUAL_DECISIONS_KEY))
     assert stored["items"]["课程"]["action"] == "candidate"
     assert stored["items"]["课程"]["candidate_key"] == candidate["candidate_key"]
 
     calls_before_restart = len(provider.calls)
-    restarted = _organizer([_row("课程")], metadata_provider=provider, enabled=True)
+    restarted = _organizer(
+        [_row("课程")],
+        metadata_provider=provider,
+        enabled=True,
+        incoming=str(incoming),
+    )
     restarted.save_data(CourseOrganizer.MANUAL_DECISIONS_KEY, stored)
+    restored = _data_item(restarted.get_review(), "课程")
+    assert restored["selected_candidate_key"] == candidate["candidate_key"]
+    assert restored["selected_candidate"] == candidate
     decision = restarted._resolve_naming(
         "课程",
         naming.DirectoryHints(1, (), False),
