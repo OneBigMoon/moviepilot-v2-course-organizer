@@ -2,6 +2,7 @@ import asyncio
 import math
 import json
 import sys
+import threading
 import time
 import types
 from typing import Any
@@ -420,6 +421,43 @@ def test_sync_ai_callback_honors_timeout():
     assert time.monotonic() - started < 0.15
     assert result.accepted is False
     assert result.decision == "local"
+
+
+def test_sync_ai_callback_timeout_limits_daemon_workers(monkeypatch):
+    gate = threading.BoundedSemaphore(1)
+    release = threading.Event()
+    entered = threading.Event()
+    calls = {"count": 0}
+    monkeypatch.setattr(providers, "_SYNC_CALLBACK_SLOTS", gate)
+
+    def blocked_callback(_payload):
+        calls["count"] += 1
+        entered.set()
+        release.wait()
+        return {"query": "海底小纵队"}
+
+    reviewer = MoviePilotAIReviewer(
+        invoke_fn=blocked_callback,
+        timeout_seconds=0.01,
+        max_attempts=1,
+    )
+    hints = naming.parse_title("海底小纵队中文版（1-8季）视频1080p")
+
+    assert reviewer.suggest_query(hints.raw_title, hints) is None
+    assert entered.is_set()
+    assert reviewer.suggest_query(hints.raw_title, hints) is None
+    assert calls["count"] == 1
+    workers = [
+        worker
+        for worker in threading.enumerate()
+        if worker.name == "courseorganizer-ai-callback"
+    ]
+    assert workers
+    assert all(worker.daemon for worker in workers)
+
+    release.set()
+    assert gate.acquire(timeout=0.5)
+    gate.release()
 
 
 def test_ai_reviewer_suggest_query_is_structured_and_rejects_invalid_output():
@@ -1138,6 +1176,31 @@ def test_naming_config_sanitize_handles_non_string_source_sequence():
     )
 
     assert config.sources == ("themoviedb", "douban")
+
+
+def test_search_only_provider_still_honors_configured_source_allowlist():
+    class SearchOnlyProvider:
+        def __init__(self):
+            self.calls = []
+
+        def search(self, queries, sources):
+            self.calls.append(tuple(sources))
+            return ProviderSearchResult((), (), tuple(sources), all_failed=False)
+
+    provider = SearchOnlyProvider()
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda _key, default=None: default,
+        save_data=lambda _key, _value: None,
+        provider=provider,
+    )
+
+    resolver_obj.resolve(
+        "课程A",
+        naming.DirectoryHints(media_count=1, seasons=(), episodic=False),
+        NamingConfig(mode="preview", sources=("douban",)),
+    )
+
+    assert provider.calls == [("douban",)]
 
 
 def test_resolver_uses_ai_query_first_and_caches_automatic_search():
