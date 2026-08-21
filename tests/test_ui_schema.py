@@ -432,6 +432,8 @@ def test_vue_build_filter_preserves_course_component_overrides():
     assert "文件移动完成，正在写入整理记录…" in page_source
     assert "设置 → 存储 &amp; 目录" in page_source
     assert "目录内没有正在下载的临时或缓存文件" in page_source
+    assert "AI 搜索与复核" in page_source
+    assert "复杂目录会先精简名称再搜索" in config_source
     assert "directoryRules" in page_source
     assert "monitoringEnabled" in page_source
     assert 'v-if="monitoringEnabled && items.length > 0"' in page_source
