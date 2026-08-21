@@ -264,7 +264,7 @@ def test_provider_resolves_sources_and_budget():
     assert len(fake.calls) <= 6
 
 
-def test_provider_marks_all_failed_only_when_every_attempt_fails():
+def test_provider_marks_empty_partial_source_failure_for_short_error_ttl():
     class FailChain:
         def __init__(self):
             self.calls = 0
@@ -278,7 +278,7 @@ def test_provider_marks_all_failed_only_when_every_attempt_fails():
     chain = FailChain()
     provider = MoviePilotMetadataProvider(chain=chain, search_source="themoviedb,douban")
     result = provider.search((naming.QueryCandidate("a", "first_clause"),), ("themoviedb", "douban"))
-    assert result.all_failed is False
+    assert result.all_failed is True
 
 
 def test_provider_marks_all_failed_when_every_source_raises():
@@ -298,7 +298,7 @@ def test_provider_marks_all_failed_when_every_source_raises():
     assert len(result.errors) == 2
 
 
-def test_provider_keeps_earlier_success_when_later_query_fails():
+def test_provider_marks_empty_partial_failure_for_short_error_ttl():
     class PartiallyFailingChain:
         def __init__(self):
             self.calls = []
@@ -320,7 +320,7 @@ def test_provider_keeps_earlier_success_when_later_query_fails():
     )
 
     assert result.candidates == ()
-    assert result.all_failed is False
+    assert result.all_failed is True
     assert result.attempted_sources == ("themoviedb",)
     assert any("second" in error for error in result.errors)
 
@@ -1632,7 +1632,8 @@ def test_library_classifier_accepts_integer_numeric_confidence():
     assert result.library == "children"
 
 
-def test_resolver_rejects_invalid_ai_confidence(monkeypatch):
+@pytest.mark.parametrize("invalid_confidence", [math.inf, True])
+def test_resolver_rejects_invalid_ai_confidence(monkeypatch, invalid_confidence):
     class SpyProvider:
         def resolve_sources(self, requested):
             return ("themoviedb",)
@@ -1660,7 +1661,7 @@ def test_resolver_rejects_invalid_ai_confidence(monkeypatch):
                 accepted=True,
                 decision="choose",
                 candidate_key="themoviedb:1:tv",
-                confidence=math.inf,
+                confidence=invalid_confidence,
                 reason_codes=("bad",),
                 error="",
             )
@@ -2033,23 +2034,28 @@ def test_identity_refreshes_external_after_30_days_and_schema_invalidation(tmp_p
     assert first.status == "auto_external"
     assert provider.calls == 1
 
-    timepoints["now"] = 31 * 24 * 60 * 60
+    timepoints["now"] = 20 * 24 * 60 * 60
     second = resolver.resolve("飘零叶 Tumble Leaf", directory, config)
     assert second.status == "auto_external"
+    assert provider.calls == 1
+
+    timepoints["now"] = 31 * 24 * 60 * 60
+    third = resolver.resolve("飘零叶 Tumble Leaf", directory, config)
+    assert third.status == "auto_external"
     assert provider.calls == 2
 
-    third = resolver.resolve(
+    fourth = resolver.resolve(
         "飘零叶 Tumble Leaf",
         directory,
         NamingConfig(mode="apply", auto_threshold=60),
     )
-    assert third.status == "auto_external"
+    assert fourth.status == "auto_external"
     assert provider.calls == 2
 
     provider_schema = SpyProvider.PROVIDER_SCHEMA_VERSION
     SpyProvider.PROVIDER_SCHEMA_VERSION = "2"
-    fourth = resolver.resolve("飘零叶 Tumble Leaf", directory, config)
-    assert fourth.status == "auto_external"
+    fifth = resolver.resolve("飘零叶 Tumble Leaf", directory, config)
+    assert fifth.status == "auto_external"
     assert provider.calls == 3
     SpyProvider.PROVIDER_SCHEMA_VERSION = provider_schema
 
