@@ -2,6 +2,7 @@ import asyncio
 import math
 import json
 import sys
+import time
 import types
 from typing import Any
 from collections import namedtuple
@@ -356,6 +357,71 @@ def test_ai_reviewer_accepts_only_whitelisted_high_confidence():
     assert result.accepted is True
 
 
+def test_ai_chain_build_failures_degrade_without_constructor_error(monkeypatch):
+    monkeypatch.setattr(
+        MoviePilotAIReviewer,
+        "_load_llm",
+        staticmethod(lambda: object()),
+    )
+
+    def fail_build(_self, _llm):
+        raise AttributeError("structured output unsupported")
+
+    monkeypatch.setattr(MoviePilotAIReviewer, "_build_prompt_chain", fail_build)
+    monkeypatch.setattr(
+        providers.MoviePilotLibraryClassifier,
+        "_build_prompt_chain",
+        fail_build,
+    )
+
+    reviewer = MoviePilotAIReviewer()
+    classifier = providers.MoviePilotLibraryClassifier()
+
+    assert reviewer._prompt_chain is None
+    assert classifier._prompt_chain is None
+
+
+def test_sync_ai_callback_honors_timeout():
+    candidate = naming.MetadataCandidate(
+        key="themoviedb:65047:tv",
+        source="themoviedb",
+        media_id="65047",
+        media_type="tv",
+        title="Tumble Leaf",
+        year=2013,
+    )
+    scored = naming.ScoredCandidate(
+        candidate=candidate,
+        score=95,
+        reason_codes=("title_match",),
+    )
+
+    def slow_callback(_payload):
+        time.sleep(0.2)
+        return {
+            "decision": "choose",
+            "candidate_key": candidate.key,
+            "confidence": 0.95,
+        }
+
+    reviewer = MoviePilotAIReviewer(
+        invoke_fn=slow_callback,
+        timeout_seconds=0.01,
+        max_attempts=1,
+    )
+    started = time.monotonic()
+    result = reviewer.review(
+        "Tumble Leaf",
+        naming.parse_title("Tumble Leaf"),
+        [scored],
+        {candidate.key: 95},
+    )
+
+    assert time.monotonic() - started < 0.15
+    assert result.accepted is False
+    assert result.decision == "local"
+
+
 def test_ai_reviewer_suggest_query_is_structured_and_rejects_invalid_output():
     captured: list[dict[str, Any]] = []
 
@@ -675,6 +741,109 @@ def test_resolver_rejects_invalid_ai_result_choices(monkeypatch):
         NamingConfig(mode="apply", ai_review=True),
     )
     assert decision.status == "local_fallback"
+
+
+def test_cached_ai_review_preserves_full_candidate_set(monkeypatch):
+    raw_title = "课程A"
+    hints = naming.parse_title(raw_title)
+    directory = naming.DirectoryHints(media_count=2, seasons=(1,), episodic=True)
+    candidates = (
+        naming.MetadataCandidate(
+            key="themoviedb:1:tv",
+            source="themoviedb",
+            media_id="1",
+            media_type="tv",
+            title="课程A",
+            year=2020,
+        ),
+        naming.MetadataCandidate(
+            key="themoviedb:2:movie",
+            source="themoviedb",
+            media_id="2",
+            media_type="movie",
+            title="课程A",
+            year=2020,
+        ),
+    )
+
+    class CachedProvider:
+        def resolve_sources(self, requested):
+            return tuple(requested)
+
+        def search(self, _queries, _sources):
+            raise AssertionError("reusable identity must avoid a network search")
+
+    class ChoosingReviewer:
+        def review(self, raw_title, hints, candidates, score_lookup):
+            return providers.AIReviewResult(
+                accepted=True,
+                decision="choose",
+                candidate_key=candidates[0].candidate.key,
+                confidence=0.95,
+                reason_codes=("ai",),
+                error="",
+            )
+
+    store = {}
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda key, default=None: store.get(key, default),
+        save_data=lambda key, value: store.__setitem__(key, value),
+        provider=CachedProvider(),
+        ai_reviewer=ChoosingReviewer(),
+        clock=lambda: 100,
+    )
+    config = NamingConfig(
+        mode="apply",
+        sources=("themoviedb",),
+        ai_review=True,
+    )
+    search_key = resolver_obj._query_hash(hints, ("themoviedb",))
+    store["naming_identity_v1"] = {
+        raw_title: {
+            "updated": 100,
+            "status": "auto_external",
+            "raw_title": raw_title,
+            "local_title": raw_title,
+            "final_root": raw_title,
+            "source": "themoviedb",
+            "media_id": "1",
+            "media_type": "tv",
+            "candidate_key": candidates[0].key,
+            "search_key": search_key,
+            "score": 90,
+            "margin": 5,
+            "reason_codes": [],
+            "source_errors": [],
+            "all_search_failed": False,
+            "cached_candidates": [item.to_dict() for item in candidates],
+            "uncertain_policy": "local",
+            "manual_local": False,
+        }
+    }
+
+    def fake_evaluate(_hints, _directory, received, **_kwargs):
+        assert tuple(received) == candidates
+        scored = naming.ScoredCandidate(
+            candidate=candidates[0],
+            score=90,
+            reason_codes=("title_match",),
+        )
+        return naming.MatchEvaluation(
+            status="review",
+            top=scored,
+            eligible=(scored,),
+            margin=5,
+            reason_codes=("review_needed",),
+        )
+
+    _patch_resolver_evaluate_candidates(monkeypatch, fake_evaluate)
+    decision = resolver_obj.resolve(raw_title, directory, config)
+
+    assert decision.status == "auto_external"
+    saved = store["naming_identity_v1"][raw_title]["cached_candidates"]
+    assert {item["key"] for item in saved} == {candidate.key for candidate in candidates}
+
+
 def test_resolver_uses_cache_without_new_network_searches(tmp_path):
     class SpyProvider:
         def __init__(self):
