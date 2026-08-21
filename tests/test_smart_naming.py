@@ -732,6 +732,96 @@ def test_resolver_uses_cache_without_new_network_searches(tmp_path):
     assert provider.calls[0][1] == ("themoviedb", "douban")
 
 
+def test_search_cache_with_future_timestamp_is_not_reused():
+    stale = naming.MetadataCandidate(
+        key="themoviedb:stale:tv",
+        source="themoviedb",
+        media_id="stale",
+        media_type="tv",
+        title="旧候选",
+    )
+    fresh = naming.MetadataCandidate(
+        key="themoviedb:fresh:tv",
+        source="themoviedb",
+        media_id="fresh",
+        media_type="tv",
+        title="新候选",
+    )
+    store = {}
+
+    class Provider:
+        def __init__(self):
+            self.calls = 0
+
+        def search(self, _queries, sources):
+            self.calls += 1
+            return ProviderSearchResult((fresh,), (), tuple(sources), all_failed=False)
+
+    provider = Provider()
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda key, default=None: store.get(key, default),
+        save_data=lambda key, value: store.__setitem__(key, value),
+        provider=provider,
+        clock=lambda: 100,
+    )
+    hints = naming.parse_title("缓存课程")
+    sources = ("themoviedb",)
+    search_key = resolver_obj._query_hash(hints, sources)
+    store["naming_search_cache_v1"] = {
+        search_key: {
+            "updated": 101,
+            "candidates": [stale.to_dict()],
+            "errors": [],
+            "attempted_sources": ["themoviedb"],
+            "all_failed": False,
+            "parser_schema": naming.PARSER_SCHEMA_VERSION,
+            "provider_schema": resolver_obj._provider_schema(),
+        }
+    }
+
+    result = resolver_obj._load_search_result(search_key, 100, hints, sources)
+
+    assert provider.calls == 1
+    assert tuple(candidate.media_id for candidate in result.candidates) == ("fresh",)
+
+
+def test_preview_pruning_uses_row_timestamp():
+    store = {}
+    current = {"now": 0}
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda key, default=None: store.get(key, default),
+        save_data=lambda key, value: store.__setitem__(key, value),
+        provider=object(),
+        clock=lambda: current["now"],
+    )
+    resolver_obj.PREVIEW_MAX = 2
+
+    for raw_title, timestamp in (("较早", 200), ("最新", 300), ("最旧", 100)):
+        current["now"] = timestamp
+        resolver_obj.record_decision(
+            NamingDecision(
+                status="local_fallback",
+                raw_title=raw_title,
+                local_title=raw_title,
+                final_root=raw_title,
+                final_prefix=raw_title,
+            )
+        )
+
+    assert {row["raw_title"] for row in resolver_obj.preview_rows()} == {"较早", "最新"}
+
+
+def test_naming_config_sanitize_handles_non_string_source_sequence():
+    config = NamingConfig.sanitize(
+        {
+            "mode": "preview",
+            "sources": [None, 7, " THEMOVIEDB ", "DouBan", ""],
+        }
+    )
+
+    assert config.sources == ("themoviedb", "douban")
+
+
 def test_resolver_uses_ai_query_first_and_caches_automatic_search():
     raw_title = "海底小纵队中文版（1-8季）视频1080p"
     store = {}
