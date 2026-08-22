@@ -4,7 +4,7 @@
 
 - **插件 ID**：`CourseOrganizer`
 - **作者**：[OneBigMoon](https://github.com/OneBigMoon)
-- **版本**：`1.7.12`（V2 插件；V3 为 `2.0.2`）
+- **版本**：`1.7.13`（V2 插件；V3 为 `2.0.3`）
 - **官方插件市场 PR**：[jxxghp/MoviePilot-Plugins#1157](https://github.com/jxxghp/MoviePilot-Plugins/pull/1157)
 - **仓库**：<https://github.com/OneBigMoon/moviepilot-v2-course-organizer>
 
@@ -64,6 +64,7 @@ MoviePilot 的"整理"必须先把文件识别成某部**有 TMDB/豆瓣 ID 的�
 
 ## 版本历史
 
+- **v1.7.13** 历史候选统一遵守当前识别来源配置，禁止绕过数据源白名单
 - **v1.7.12** 新增智能助手开关说明，明确需先在 MoviePilot 配置并启用模型
 - **v1.7.11** 智能助手先精简复杂目录名再搜索 TMDB，并识别 1-8 季范围
 - **v1.7.10** 重新打开或搜索后保留已关联的 TMDB 作品并默认选中
