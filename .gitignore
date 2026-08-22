@@ -10,6 +10,7 @@ htmlcov/
 
 # Vue plugin dependencies (the reproducible lockfile and built dist are kept)
 plugins.v2/courseorganizer/node_modules/
+plugins.v3/courseorganizer/node_modules/
 
 # Packaging artifacts
 *.egg-info/
