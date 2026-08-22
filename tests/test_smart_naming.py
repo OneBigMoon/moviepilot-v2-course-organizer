@@ -2741,6 +2741,64 @@ def test_manual_douban_candidate_never_uses_tmdb_id_suffix():
     assert "tmdbid" not in decision.final_root
 
 
+@pytest.mark.parametrize("history_source", ["identity", "query", "manual"])
+def test_manual_candidate_override_respects_current_source_allowlist(history_source):
+    raw_title = "历史 TMDB 关联"
+    candidate = naming.MetadataCandidate(
+        key="themoviedb:123:tv",
+        source="themoviedb",
+        media_id="123",
+        media_type="tv",
+        title="历史 TMDB 关联",
+        year=2020,
+    )
+    identity = {}
+    store = {}
+    if history_source == "identity":
+        identity["cached_candidates"] = [candidate.to_dict()]
+    elif history_source == "query":
+        identity["last_query_candidates"] = [candidate.to_dict()]
+    else:
+        store["naming_manual_decisions_v1"] = {
+            "schema": 1,
+            "items": {raw_title: {"candidate": candidate.to_dict()}},
+        }
+    if identity:
+        store["naming_identity_v1"] = {raw_title: identity}
+
+    class EmptyDoubanProvider:
+        def resolve_sources(self, requested):
+            return tuple(requested)
+
+        def search(self, queries, sources):
+            return ProviderSearchResult(
+                candidates=(),
+                errors=(),
+                attempted_sources=tuple(sources),
+                all_failed=False,
+            )
+
+    resolver_obj = SmartNamingResolver(
+        load_data=lambda key, default=None: store.get(key, default),
+        save_data=lambda key, value: store.__setitem__(key, value),
+        provider=EmptyDoubanProvider(),
+    )
+
+    decision = resolver_obj.resolve(
+        raw_title,
+        naming.DirectoryHints(media_count=1, seasons=(1,), episodic=True),
+        NamingConfig(
+            mode="apply",
+            sources=("douban",),
+            manual_overrides=f"{raw_title} => candidate:{candidate.key}",
+        ),
+    )
+
+    assert decision.status == "invalid_override"
+    assert decision.blocked_reason == "candidate_not_found"
+    assert decision.source == ""
+
+
 def test_query_override_integration_records_cache_and_blocks_move(tmp_path):
     incoming = tmp_path / "incoming"
     output = tmp_path / "output"
